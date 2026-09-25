@@ -1,0 +1,20 @@
+[project]
+name = "dataset-rag"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.141.1",
+    "grandalf>=0.8",
+    "langchain>=1.3.15",
+    "langchain-community>=0.4.2",
+    "langchain-openai>=1.4.3",
+    "langgraph>=1.2.11",
+    "loguru>=0.7.3",
+    "minio>=7.2.20",
+    "pymilvus>=3.0.1",
+    "pymilvus-model>=0.3.2",
+    "pymongo>=4.17.0",
+    "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.32",
+    "uvicorn>=0.52.2",
+]

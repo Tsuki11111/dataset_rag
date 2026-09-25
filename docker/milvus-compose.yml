@@ -1,0 +1,70 @@
+# Milvus standalone 依赖编排（etcd 存元数据 + 复用已有 minio 存数据）
+#
+# 首次启动：
+#   docker network create milvus-net
+#   docker network connect milvus-net minio        # 把已有 minio 接入，只需执行一次
+#   docker compose -f docker/milvus-compose.yml up -d
+#
+# 停止：docker compose -f docker/milvus-compose.yml down      # 数据保留在命名卷里
+# 彻底清理（含数据）：docker compose -f docker/milvus-compose.yml down -v
+#
+# 这里不声明 minio service：compose 只管理自己创建的容器，
+# 已有的 minio 用 docker network connect 手动接入，避免 compose down 时误删。
+services:
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.18
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - milvus-etcd-data:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - milvus-net
+
+  milvus:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.5.4
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      # 指向已有的 minio 容器名，凭据与应用侧保持一致
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - milvus-data:/var/lib/milvus
+    ports:
+      - "19530:19530"   # SDK 连接端口
+      - "9091:9091"     # 健康检查 / metrics 端口
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    depends_on:
+      etcd:
+        condition: service_healthy
+    networks:
+      - milvus-net
+
+networks:
+  # 已存在且接入了 minio，声明为 external，compose 只使用不创建/删除
+  milvus-net:
+    external: true
+    name: milvus-net
+
+volumes:
+  milvus-etcd-data:
+  milvus-data:

@@ -1,0 +1,38 @@
+# ===== 密钥与配置 =====
+# .env 含 OPENAI_API_KEY / MINERU_API_TOKEN / MINIO_* 等真实密钥，绝不入库
+.env
+.env.*
+!.env.example
+
+# ===== 运行产物 =====
+# output/ 是按文档隔离的中间产物（md、图片、chunks.json、解析结果 zip），体积大且可重新生成
+output/
+logs/
+*.log
+
+# SQLite 去重记录（本机运行态数据）
+data/*.db
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+# Claude Code 本机个人配置（权限白名单等），不入库；launch.json 是项目级服务配置，保留
+.claude/settings.local.json
+
+# ===== 备份 =====
+.git.bak/
+
+# ===== 原始素材 =====
+# doc/ 下的 PDF 手册与打包 zip（含 302MB 的 设备手册汇总.zip），不入库
+doc/
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db

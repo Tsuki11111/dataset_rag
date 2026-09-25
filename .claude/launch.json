@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "import-service",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "app.import_process.api.file_import_service"],
+      "port": 8001
+    },
+    {
+      "name": "query-service",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "app.query_process.api.query_service"],
+      "port": 8002
+    }
+  ]
+}
