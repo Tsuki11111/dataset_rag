@@ -84,14 +84,16 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 检索链路 —— 部分完成 🚧
 
+8 个节点已完成 3 个，其余 4 个是骨架 + 1 个半成品。
+
 | 节点 | 状态 | 说明 |
 |---|---|---|
 | `node_item_name_confirm` | ✅ | 7 步完整：LLM 提取产品名+改写问题 → 向量对齐 → 三分支（确认/反问/拒识） → 写历史 |
-| `node_search_embedding` | ⬜ | 骨架，待接 `dense_search` |
-| `node_search_embedding_hyde` | ⬜ | 骨架，待接 HyDE |
-| `node_web_search_mcp` | ⬜ | 骨架，依赖百炼 MCP 联网搜索 |
+| `node_search_embedding` | ✅ | 改写问题 → 向量化 → `dense_search`（带 `item_name` 过滤）→ `embedding_chunks`；单节点实测 Top1 0.64 |
+| `node_search_embedding_hyde` | ✅ | LLM 生成假设文档 → 「问题+假设文档」向量化 → 检索 → `hyde_embedding_chunks` + `hyde_doc`；单节点实测 Top1 0.71 |
+| `node_web_search_mcp` | ⬜ | 骨架，依赖百炼 MCP 联网搜索（端点已实测可用：`initialize` / `tools/list` / `tools/call` 全通） |
 | `node_query_kg` | ⬜ | 骨架，依赖 Neo4j（本地未部署） |
-| `node_rrf` | ⬜ | 骨架，待接 RRF 融合算法 |
+| `node_rrf` | ⬜ | 骨架，**当前堵点**：下游 `node_rerank` 要 `rrf_chunks`，它一通上面两路结果才能往下流 |
 | `node_rerank` | ⬜ | 骨架，待接 BGE Reranker |
 | `node_answer_output` | 🚧 | SSE 流式推送与历史存档已完成；**答案内容仍是占位文本**，未接 LLM 生成 |
 
@@ -104,9 +106,9 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 未开始 ⬜
 
-- 检索链路的真实检索与答案生成（当前是骨架 + 占位文本）
-- Neo4j 知识图谱（`neo4j_utils.py` 无引用，图节点为骨架）
-- 重排序（`reranker_utils.py` 无引用）
+- RRF 融合与重排序（`node_rrf` / `node_rerank` 仍是骨架，`reranker_utils.py` 无引用）
+- 联网搜索与图谱检索（`node_web_search_mcp` / `node_query_kg`）
+- 答案生成（`node_answer_output` 仍输出占位文本）
 
 ---
 
@@ -149,6 +151,11 @@ MINIO_IMG_DIR=/upload-images
 # ── MinerU（PDF 解析）──
 MINERU_API_TOKEN=sk-xxx
 MINERU_BASE_URL=https://mineru.net/api/v4
+
+# ── 百炼 MCP（联网搜索，供 node_web_search_mcp 使用）──
+# 鉴权复用 OPENAI_API_KEY；Streamable HTTP 协议，服务端无状态（响应不带 session-id）
+# 目前仅一个工具 search_pro，参数 query
+MCP_DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/api/v1/mcps/EnhancedSearch/mcp
 ```
 
 ### 2. 启动依赖服务（Docker）
@@ -266,8 +273,8 @@ docker run -d --name mongo -p 27017:27017 -v mongo-data:/data/db mongo:8
 
 | 项 | 说明 |
 |---|---|
-| 检索节点为骨架 | `node_search_embedding` 等 6 个节点只有 `sleep` + 返回空列表，走完分支 A 后拿不到真实结果 |
-| 答案仍是占位文本 | `node_answer_output` 在 `state['answer']` 为空时输出固定的演示文本，未接 LLM 生成 |
+| 检索节点为骨架 | `node_web_search_mcp` / `node_query_kg` / `node_rrf` / `node_rerank` 只有 `sleep` + 返回空列表，走完分支 A 后拿不到真实结果 |
+| 答案仍是占位文本 | `node_answer_output` 在 `state['answer']` 为空时输出固定的演示文本，未接 LLM 生成；`image_urls` 也还是硬编码的 `example.com` |
 | `get_recent_messages` 曾取错数据 | 原实现 `sort(ASCENDING).limit(N)` 取的是**最旧** N 条，已修为倒序取再反转为正序 |
 | 相似度阈值 | `kb_item_names` 的 0.85/0.6 阈值取自教程代码（教程正文写的是 0.95，两处不一致） |
 | 无引用的模块 | `neo4j_utils.py`、`reranker_utils.py`、`format_utils.py`、`mongo_history_utils_new.py` 均无引用 |
