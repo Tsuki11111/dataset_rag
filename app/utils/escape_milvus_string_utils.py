@@ -22,3 +22,24 @@ def escape_milvus_string(value: str) -> str:
     # 替换换行/回车/制表符为空格，保证表达式单行有效
     s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
     return s
+
+
+def build_item_name_filter(item_names) -> str:
+    """
+    构造「按产品名限定检索范围」的 Milvus 过滤表达式
+
+    形如：item_name in ["产品A", "产品B"]
+
+    每个产品名都经过转义 —— 产品名由大模型生成，可能含引号等字符，
+    不转义会让整个过滤表达式解析失败（检索直接报错）。
+    :param item_names: 产品名列表
+    :return: 过滤表达式；无有效产品名时返回 ""，调用方据此不做过滤
+    """
+    if not item_names:
+        return ""
+    # 先剔除空值再转义，避免拼出 item_name in ["", "A"] 这种表达式
+    names = [str(v).strip() for v in item_names if v and str(v).strip()]
+    if not names:
+        return ""
+    quoted = ", ".join(f'"{escape_milvus_string(v)}"' for v in names)
+    return f"item_name in [{quoted}]"

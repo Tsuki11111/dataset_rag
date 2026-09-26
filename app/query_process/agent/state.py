@@ -12,6 +12,8 @@ class QueryGraphState(TypedDict):
     # 检索过程中的中间数据
     embedding_chunks: list  # 普通向量检索回来的切片
     hyde_embedding_chunks: list  # HyDE 检索回来的切片
+    hyde_doc: str  # HyDE 由大模型生成的假设性文档（检索用的中间产物，便于调试）
+    kg_chunks: list  # 知识图谱检索回来的切片
     web_search_docs: list  # 网络搜索回来的文档
 
     # 排序过程中的数据
@@ -37,6 +39,8 @@ query_graph_default_state: QueryGraphState = {
     "original_query": "",
     "embedding_chunks": [],
     "hyde_embedding_chunks": [],
+    "hyde_doc": "",
+    "kg_chunks": [],
     "web_search_docs": [],
     "rrf_chunks": [],
     "reranked_docs": [],

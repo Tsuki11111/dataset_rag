@@ -13,6 +13,11 @@ logs/
 # SQLite 去重记录（本机运行态数据）
 data/*.db
 
+# ===== 临时文档 =====
+# HANDOFF.md 是一次性交接文档（写给下一个开发会话），项目状态稳定后应删除，
+# 长期项目文档见 README.md
+HANDOFF.md
+
 # ===== Python =====
 __pycache__/
 *.py[cod]
