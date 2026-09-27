@@ -85,7 +85,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 检索链路 —— 部分完成 🚧
 
-8 个节点已完成 4 个，其余 3 个是骨架 + 1 个半成品。
+8 个节点已完成 5 个，其余 2 个是骨架 + 1 个半成品。
 
 | 节点 | 状态 | 说明 |
 |---|---|---|
@@ -94,7 +94,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 | `node_search_embedding_hyde` | ✅ | LLM 生成假设文档 → 「问题+假设文档」向量化 → 检索 → `hyde_embedding_chunks` + `hyde_doc`；单节点实测 Top1 0.71 |
 | `node_web_search_mcp` | ✅ | 异步调百炼 MCP 增强搜索（工具 `search_pro`）→ `web_search_docs`；图内实测返回 5 条 |
 | `node_query_kg` | ⬜ | 骨架，依赖 Neo4j（本地未部署） |
-| `node_rrf` | ⬜ | 骨架，**当前堵点**：下游 `node_rerank` 要 `rrf_chunks`，它一通上面两路结果才能往下流 |
+| `node_rrf` | ✅ | 加权 RRF 融合切片类召回（基线 / HyDE / 图谱，k=60）→ `rrf_chunks`；图内实测 5+5 输入去重融合为 6 条 |
 | `node_rerank` | ⬜ | 骨架，待接 BGE Reranker |
 | `node_answer_output` | 🚧 | SSE 流式推送与历史存档已完成；**答案内容仍是占位文本**，未接 LLM 生成 |
 
@@ -107,7 +107,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 未开始 ⬜
 
-- RRF 融合与重排序（`node_rrf` / `node_rerank` 仍是骨架，`reranker_utils.py` 无引用）
+- 重排序（`node_rerank` 仍是骨架，`reranker_utils.py` 无引用）
 - 图谱检索（`node_query_kg` 仍依赖本地未部署的 Neo4j）
 - 答案生成（`node_answer_output` 仍输出占位文本）
 
@@ -277,13 +277,16 @@ docker run -d --name mongo -p 27017:27017 -v mongo-data:/data/db mongo:8
 
 还有一处教程没覆盖的坑：非流式路径下 `run_query_graph` 是在 `async def` 路由里**直接被调用**的，此时事件循环已在运行，`asyncio.run()` 会抛 `RuntimeError`。`mcp_search_utils._run_coro` 检测到这种情况就另开线程执行（流式路径走 `BackgroundTasks` 线程池，不受影响）。
 
+**RRF 只融合切片类召回，联网结果留给重排**
+联网搜索返回的是 `{title, url, snippet}`，**没有 `chunk_id`**，而 RRF 靠 `chunk_id` 跨路去重计分，硬塞进去只会被当成无效项丢弃。教程的设计正是如此分工：RRF 管同源融合（基线 / HyDE / 图谱，都是 Milvus 切片），跨源合并（切片 + 网页结果）交给 `node_rerank`。所以 `node_web_search_mcp` 的结果不会白做，它在重排阶段并入。
+
 ---
 
 ## 已知问题 / 待办
 
 | 项 | 说明 |
 |---|---|
-| 检索节点为骨架 | `node_query_kg` / `node_rrf` / `node_rerank` 只有 `sleep` + 返回空列表，走完分支 A 后拿不到真实结果 |
+| 检索节点为骨架 | `node_query_kg` / `node_rerank` 只有 `sleep` + 返回空列表，走完分支 A 后拿不到真实结果 |
 | 自带图测试场景1恒失败 | `main_graph.py` 的 `__main__` 拿「烫金膜盒怎么安装？」（不带型号）当查询，产品名确认必然判拒识，四路检索全被跳过。这是既有缺陷，与该测试想验证的图拓扑无关；换成完整产品名即可通过 |
 | 答案仍是占位文本 | `node_answer_output` 在 `state['answer']` 为空时输出固定的演示文本，未接 LLM 生成；`image_urls` 也还是硬编码的 `example.com` |
 | `get_recent_messages` 曾取错数据 | 原实现 `sort(ASCENDING).limit(N)` 取的是**最旧** N 条，已修为倒序取再反转为正序 |
