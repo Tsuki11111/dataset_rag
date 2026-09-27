@@ -28,8 +28,12 @@ venv/
 # ===== IDE / 编辑器 =====
 .idea/
 .vscode/
-# Claude Code 本机个人配置（权限白名单等），不入库；launch.json 是项目级服务配置，保留
+# Claude Code 本机个人文件，不入库：
+#   settings.local.json —— 权限白名单等
+#   CLAUDE.md —— 写给本机 AI 会话的项目约定，与 HANDOFF.md 同性质
+# launch.json 是项目级服务配置，保留
 .claude/settings.local.json
+CLAUDE.md
 
 # ===== 备份 =====
 .git.bak/

@@ -21,6 +21,7 @@
 | 对象存储 | MinIO |
 | 会话历史 / 去重记录 | MongoDB |
 | PDF 解析 | MinerU（云端 API） |
+| 联网搜索 | 百炼 MCP `EnhancedSearch`（openai-agents 客户端，**`mcp<2`**） |
 | Web | FastAPI + 原生 HTML/JS（无框架） |
 | 包管理 | uv（Python ≥ 3.12） |
 
@@ -84,14 +85,14 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 检索链路 —— 部分完成 🚧
 
-8 个节点已完成 3 个，其余 4 个是骨架 + 1 个半成品。
+8 个节点已完成 4 个，其余 3 个是骨架 + 1 个半成品。
 
 | 节点 | 状态 | 说明 |
 |---|---|---|
 | `node_item_name_confirm` | ✅ | 7 步完整：LLM 提取产品名+改写问题 → 向量对齐 → 三分支（确认/反问/拒识） → 写历史 |
 | `node_search_embedding` | ✅ | 改写问题 → 向量化 → `dense_search`（带 `item_name` 过滤）→ `embedding_chunks`；单节点实测 Top1 0.64 |
 | `node_search_embedding_hyde` | ✅ | LLM 生成假设文档 → 「问题+假设文档」向量化 → 检索 → `hyde_embedding_chunks` + `hyde_doc`；单节点实测 Top1 0.71 |
-| `node_web_search_mcp` | ⬜ | 骨架，依赖百炼 MCP 联网搜索（端点已实测可用：`initialize` / `tools/list` / `tools/call` 全通） |
+| `node_web_search_mcp` | ✅ | 异步调百炼 MCP 增强搜索（工具 `search_pro`）→ `web_search_docs`；图内实测返回 5 条 |
 | `node_query_kg` | ⬜ | 骨架，依赖 Neo4j（本地未部署） |
 | `node_rrf` | ⬜ | 骨架，**当前堵点**：下游 `node_rerank` 要 `rrf_chunks`，它一通上面两路结果才能往下流 |
 | `node_rerank` | ⬜ | 骨架，待接 BGE Reranker |
@@ -107,7 +108,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 ### 未开始 ⬜
 
 - RRF 融合与重排序（`node_rrf` / `node_rerank` 仍是骨架，`reranker_utils.py` 无引用）
-- 联网搜索与图谱检索（`node_web_search_mcp` / `node_query_kg`）
+- 图谱检索（`node_query_kg` 仍依赖本地未部署的 Neo4j）
 - 答案生成（`node_answer_output` 仍输出占位文本）
 
 ---
@@ -267,13 +268,23 @@ docker run -d --name mongo -p 27017:27017 -v mongo-data:/data/db mongo:8
 - `kb_chunks`：按 `file_title` 先删后插（**不能按 `item_name`**，不同文档可能描述同一产品，会误删）
 - `kb_item_names`：`item_name` 作主键 + 按 `file_title` 清理同文档旧名
 
+**MCP 联网搜索：沿用教程的异步 SDK，但传输类必须换、`mcp` 必须钉在 1.x**
+整体按教程写（`openai-agents` 的 MCP 客户端 + `asyncio` 桥接），但有三处不得不偏离：
+
+- **传输类换成 `MCPServerStreamableHttp`**：教程的 `MCPServerSse` 连 `/sse`，而本服务的 `/sse` 返回 200 后**一个字节都不推**（实测挂起 25 秒无输出），该客户端依赖服务端先发 `endpoint` 事件，根本用不了。改连 `/mcp`。
+- **`mcp` 必须 `<2`**：mcp 2.x 改用 `server/discover` 新握手（协议 `2026-07-28`），百炼服务端仍是 `2024-11-05` 老协议，收到直接回 **HTTP 500**。**升级 mcp 会静默打断联网搜索**，`pyproject.toml` 已加约束。
+- **工具名与参数**：本服务只有 `search_pro`，且**只接受 `query`**；照教程传 `count` 会直接 `isError`。
+
+还有一处教程没覆盖的坑：非流式路径下 `run_query_graph` 是在 `async def` 路由里**直接被调用**的，此时事件循环已在运行，`asyncio.run()` 会抛 `RuntimeError`。`mcp_search_utils._run_coro` 检测到这种情况就另开线程执行（流式路径走 `BackgroundTasks` 线程池，不受影响）。
+
 ---
 
 ## 已知问题 / 待办
 
 | 项 | 说明 |
 |---|---|
-| 检索节点为骨架 | `node_web_search_mcp` / `node_query_kg` / `node_rrf` / `node_rerank` 只有 `sleep` + 返回空列表，走完分支 A 后拿不到真实结果 |
+| 检索节点为骨架 | `node_query_kg` / `node_rrf` / `node_rerank` 只有 `sleep` + 返回空列表，走完分支 A 后拿不到真实结果 |
+| 自带图测试场景1恒失败 | `main_graph.py` 的 `__main__` 拿「烫金膜盒怎么安装？」（不带型号）当查询，产品名确认必然判拒识，四路检索全被跳过。这是既有缺陷，与该测试想验证的图拓扑无关；换成完整产品名即可通过 |
 | 答案仍是占位文本 | `node_answer_output` 在 `state['answer']` 为空时输出固定的演示文本，未接 LLM 生成；`image_urls` 也还是硬编码的 `example.com` |
 | `get_recent_messages` 曾取错数据 | 原实现 `sort(ASCENDING).limit(N)` 取的是**最旧** N 条，已修为倒序取再反转为正序 |
 | 相似度阈值 | `kb_item_names` 的 0.85/0.6 阈值取自教程代码（教程正文写的是 0.95，两处不一致） |

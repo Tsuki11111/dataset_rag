@@ -10,7 +10,12 @@ dependencies = [
     "langchain-openai>=1.4.3",
     "langgraph>=1.2.11",
     "loguru>=0.7.3",
+    # 必须 <2：mcp 2.x 改用 server/discover 新握手（协议 2026-07-28），
+    # 百炼 MCP 服务端仍是 2024-11-05 老协议，收到会回 HTTP 500 导致联网搜索全挂。
+    # 由 openai-agents 间接依赖，故在此显式钉版本。
+    "mcp<2",
     "minio>=7.2.20",
+    "openai-agents>=0.20.0",
     "pymilvus>=3.0.1",
     "pymilvus-model>=0.3.2",
     "pymongo>=4.17.0",
