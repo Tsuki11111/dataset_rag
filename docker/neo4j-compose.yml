@@ -1,0 +1,45 @@
+# Neo4j Community 编排（导入侧知识图谱 node_import_kg 的存储）
+#
+# 启动：docker compose -f docker/neo4j-compose.yml up -d
+# 停止：docker compose -f docker/neo4j-compose.yml down     # 数据保留在命名卷里
+# 彻底清理（含数据）：docker compose -f docker/neo4j-compose.yml down -v
+#
+# 浏览器界面：http://127.0.0.1:7474  （用户名 neo4j，密码与 .env 的 NEO4J_PASSWORD 一致）
+#
+# 与其他容器一样不设 restart policy：Docker Desktop 重启后需手动拉起，
+# 应用侧有 is_neo4j_available() 兜底，挂掉不会让文档导入失败。
+#
+# 显式声明 project 名：否则 compose 会按目录名（docker）归组，
+# 把同目录 milvus-compose.yml 起的容器当成「孤儿」，
+# 一旦有人执行 down --remove-orphans 就会连带删掉 Milvus。
+name: neo4j
+
+services:
+  neo4j:
+    container_name: neo4j
+    # 5.x LTS；6.x 取消社区版，不再升级
+    image: neo4j:5.26
+    environment:
+      # 用户名/密码需与 .env 的 NEO4J_USERNAME / NEO4J_PASSWORD 一致
+      # 注意 Neo4j 要求密码至少 8 位
+      NEO4J_AUTH: neo4j/123123123
+      # 限制内存占用，避免在小内存机器上把 Docker 撑爆
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
+    ports:
+      - "7474:7474"   # HTTP / Neo4j Browser
+      - "7687:7687"   # Bolt，应用 SDK 连接端口
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider localhost:7474 || exit 1"]
+      interval: 30s
+      start_period: 60s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  neo4j-data:
+  neo4j-logs:
