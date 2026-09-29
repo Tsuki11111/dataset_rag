@@ -17,6 +17,7 @@
 | 编排 | LangGraph |
 | 大模型 | 通义千问（OpenAI 兼容接口，`langchain-openai`） |
 | 嵌入 | DashScope `text-embedding-v2`（1536 维，**仅稠密向量**） |
+| 重排 | DashScope `gte-rerank-v2`（**原生端点，非 OpenAI 兼容**） |
 | 向量库 | Milvus 2.5（standalone） |
 | 对象存储 | MinIO |
 | 会话历史 / 去重记录 | MongoDB |
@@ -36,6 +37,7 @@ app/
 │   ├── minio_utils.py       # MinIO 客户端
 │   ├── mongo_history_utils.py   # 会话历史读写
 │   ├── mongo_dedup_utils.py     # 上传去重指纹
+│   ├── mcp_search_utils.py  # 百炼 MCP 联网搜索（Streamable HTTP）
 │   └── neo4j_utils.py       # 知识图谱（未使用）
 ├── conf/                    # 各服务的配置类（读 .env）
 ├── core/                    # 日志、提示词加载
@@ -85,7 +87,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 检索链路 —— 部分完成 🚧
 
-8 个节点已完成 5 个，其余 2 个是骨架 + 1 个半成品。
+8 个节点已完成 6 个，其余 1 个是骨架 + 1 个半成品。
 
 | 节点 | 状态 | 说明 |
 |---|---|---|
@@ -95,7 +97,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 | `node_web_search_mcp` | ✅ | 异步调百炼 MCP 增强搜索（工具 `search_pro`）→ `web_search_docs`；图内实测返回 5 条 |
 | `node_query_kg` | ⬜ | 骨架，依赖 Neo4j（本地未部署） |
 | `node_rrf` | ✅ | 加权 RRF 融合切片类召回（基线 / HyDE / 图谱，k=60）→ `rrf_chunks`；图内实测 5+5 输入去重融合为 6 条 |
-| `node_rerank` | ⬜ | 骨架，待接 BGE Reranker |
+| `node_rerank` | ✅ | 合并本地切片 + 联网结果为统一格式 → DashScope 重排打分 → 动态 Top-K（断崖截断）→ `reranked_docs`；图内实测 6+5 输入输出 8 条 |
 | `node_answer_output` | 🚧 | SSE 流式推送与历史存档已完成；**答案内容仍是占位文本**，未接 LLM 生成 |
 
 **查询服务**（`query_service.py`，端口 **8002**）已完成：
@@ -107,8 +109,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 未开始 ⬜
 
-- 重排序（`node_rerank` 仍是骨架，`reranker_utils.py` 无引用）
-- 图谱检索（`node_query_kg` 仍依赖本地未部署的 Neo4j）
+- 图谱检索（`node_query_kg` 仍依赖未部署的 Neo4j）
 - 答案生成（`node_answer_output` 仍输出占位文本）
 
 ---
@@ -131,6 +132,10 @@ EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 EMBEDDING_MODEL=text-embedding-v2
 EMBEDDING_DIM=1536
 EMBEDDING_BATCH_SIZE=16
+
+# ── 重排模型（DashScope，注意不是 OpenAI 兼容端点）──
+# 不设置时复用 OPENAI_API_KEY
+RERANK_MODEL=gte-rerank-v2
 
 # ── Milvus ──
 MILVUS_URL=http://127.0.0.1:19530
@@ -280,15 +285,31 @@ docker run -d --name mongo -p 27017:27017 -v mongo-data:/data/db mongo:8
 **RRF 只融合切片类召回，联网结果留给重排**
 联网搜索返回的是 `{title, url, snippet}`，**没有 `chunk_id`**，而 RRF 靠 `chunk_id` 跨路去重计分，硬塞进去只会被当成无效项丢弃。教程的设计正是如此分工：RRF 管同源融合（基线 / HyDE / 图谱，都是 Milvus 切片），跨源合并（切片 + 网页结果）交给 `node_rerank`。所以 `node_web_search_mcp` 的结果不会白做，它在重排阶段并入。
 
+**重排走 API，动态 Top-K 的阈值按 API 的分数尺度改过**
+教程用本地 BGE（`FlagEmbedding` 的 `FlagReranker`），本项目改用 DashScope `gte-rerank-v2`，取舍同嵌入模型——项目已是全 DashScope 架构（LLM / 嵌入 / 重排共用一个 key），本地路线要装 torch（约 2GB）+ 下载 1.3GB 模型，且本机无 CUDA 只能 CPU 推理，而重排每次查询都要跑。
+
+**两者的分数尺度不同，教程的阈值不能直接搬**：
+
+- 本地 BGE 返回**无界 logits**，教程的断崖阈值是按这个尺度调的
+- `gte-rerank-v2` 返回 **0~1 归一化分数**，实测真实查询下相邻最大落差仅约 0.14
+
+据此在 `node_rerank.py` 顶部改了两处常量：
+
+- **去掉绝对阈值 `GAP_ABS=0.5`** —— 在这个尺度下永远不会触发，是死参数，只保留相对阈值 `GAP_RATIO=0.25`
+- **`MIN_TOPK` 由 1 抬到 3** —— 截断循环从 `MIN_TOPK-1` 起探测，`MIN_TOPK` 因此是硬地板；教程的 1 曾导致 5 条候选因 0.79 → 0.38 的陡降被截到只剩 1 条，答案生成靠一条切片支撑显然不够
+
+调参时要先用真实查询统计分数分布，不要凭感觉改。
+
 ---
 
 ## 已知问题 / 待办
 
 | 项 | 说明 |
 |---|---|
-| 检索节点为骨架 | `node_query_kg` / `node_rerank` 只有 `sleep` + 返回空列表，走完分支 A 后拿不到真实结果 |
+| 检索节点为骨架 | `node_query_kg` 只有 `sleep` + 返回空列表，走完分支 A 后它那一路拿不到真实结果 |
 | 自带图测试场景1恒失败 | `main_graph.py` 的 `__main__` 拿「烫金膜盒怎么安装？」（不带型号）当查询，产品名确认必然判拒识，四路检索全被跳过。这是既有缺陷，与该测试想验证的图拓扑无关；换成完整产品名即可通过 |
 | 答案仍是占位文本 | `node_answer_output` 在 `state['answer']` 为空时输出固定的演示文本，未接 LLM 生成；`image_urls` 也还是硬编码的 `example.com` |
 | `get_recent_messages` 曾取错数据 | 原实现 `sort(ASCENDING).limit(N)` 取的是**最旧** N 条，已修为倒序取再反转为正序 |
 | 相似度阈值 | `kb_item_names` 的 0.85/0.6 阈值取自教程代码（教程正文写的是 0.95，两处不一致） |
-| 无引用的模块 | `neo4j_utils.py`、`reranker_utils.py`、`format_utils.py`、`mongo_history_utils_new.py` 均无引用 |
+| 无引用的模块 | `neo4j_utils.py`、`format_utils.py`、`mongo_history_utils_new.py` 均无引用 |
+| 重排相对阈值验证样本少 | `GAP_RATIO=0.25` 由教程继承（相对值可跨尺度迁移），但只在少数真实查询上验证过，候选规模变化后可能仍需微调 |

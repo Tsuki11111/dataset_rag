@@ -6,16 +6,24 @@ from dotenv import load_dotenv
 # 提前加载.env配置文件（保持和原代码一致，只需执行一次）
 load_dotenv()
 
+# 默认端点：DashScope 原生重排接口，注意它不是 OpenAI 兼容端点
+DEFAULT_RERANK_URL = (
+    "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+)
+
+
+# 定义重排序配置（已由本地 BGE 切换为 DashScope gte-rerank-v2，与 reranker_utils.py 一致）
 @dataclass
 class RerankerConfig:
-    bge_reranker_large: str  # 本地模型路径
-    bge_reranker_device: str       # 模型仓库标识
-    bge_reranker_fp16: bool    # 是否开启半精度（1=True/0=False）
+    base_url: str  # DashScope 原生重排端点
+    api_key: str   # API密钥
+    model: str     # 重排模型名
 
-# 实例化配置对象，和原代码lm_config风格保持一致
+
+# 实例化配置对象，和 embedding_config 风格保持一致
 reranker_config = RerankerConfig(
-    bge_reranker_large=os.getenv("BGE_RERANKER_LARGE"),
-    bge_reranker_device=os.getenv("BGE_RERANKER_DEVICE"),
-    # 特殊处理：将.env中的1/0转为布尔值，兼容常见的数字/字符串格式
-    bge_reranker_fp16=os.getenv("BGE_RERANKER_FP16") in ("1", "True", "true", 1)
+    base_url=os.getenv("RERANK_BASE_URL") or DEFAULT_RERANK_URL,
+    # 复用大模型的密钥，未单独配置 RERANK_API_KEY 时回退到 OPENAI_API_KEY
+    api_key=os.getenv("RERANK_API_KEY") or os.getenv("OPENAI_API_KEY"),
+    model=os.getenv("RERANK_MODEL") or "gte-rerank-v2",
 )
