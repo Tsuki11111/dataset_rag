@@ -51,6 +51,9 @@ _SCHEMA_STATEMENTS = (
     "CREATE CONSTRAINT chunk_key IF NOT EXISTS FOR (n:Chunk) REQUIRE n.chunk_id IS UNIQUE",
     "CREATE INDEX entity_file_title IF NOT EXISTS FOR (n:Entity) ON (n.file_title)",
     "CREATE INDEX chunk_file_title IF NOT EXISTS FOR (n:Chunk) ON (n.file_title)",
+    # 检索侧按 item_name 跨文档查（图谱按 file_title 隔离写入，但查询应按产品聚合）
+    "CREATE INDEX entity_item_name IF NOT EXISTS FOR (n:Entity) ON (n.item_name)",
+    "CREATE INDEX chunk_item_name IF NOT EXISTS FOR (n:Chunk) ON (n.item_name)",
 )
 
 
@@ -128,6 +131,36 @@ _READ_GRAPH_EDGES = """
 MATCH (a:Entity {file_title: $ft})-[r:REL]->(b:Entity {file_title: $ft})
 RETURN a.name AS source, b.name AS target, r.type AS type
 """
+
+
+# ========================
+# Cypher：检索侧查询（node_query_kg）
+# ========================
+# 种子：实体名直接出现在问题文本里
+_QUERY_KG_SEEDS = """
+MATCH (e:Entity)
+WHERE e.item_name IN $items AND $q CONTAINS e.name
+RETURN DISTINCT e.name AS name
+"""
+
+# 扩展：种子的一跳邻居（REL 不写方向，入边出边都算）
+_QUERY_KG_NEIGHBORS = """
+MATCH (e:Entity)-[:REL]-(nb:Entity)
+WHERE e.item_name IN $items AND e.name IN $seeds AND nb.item_name IN $items
+RETURN DISTINCT nb.name AS name
+"""
+
+# 这些实体挂载在哪些切片上，同时带回 df（该实体出现在几个切片里）用于逆文档频率打折
+_QUERY_KG_CHUNKS = """
+MATCH (e:Entity)-[:APPEARS_IN]->(c:Chunk)
+WHERE e.item_name IN $items AND e.name IN $names
+WITH e.name AS entity, collect(DISTINCT c.chunk_id) AS chunk_ids
+RETURN entity, chunk_ids, size(chunk_ids) AS df
+"""
+
+# 打分权重：直接命中的实体比一跳邻居更能代表用户意图
+KG_SEED_WEIGHT = 2.0
+KG_NEIGHBOR_WEIGHT = 1.0
 
 
 def is_neo4j_available() -> bool:
@@ -322,6 +355,83 @@ def read_doc_graph(file_title: str) -> Dict[str, Any]:
         return {"available": False, "error": str(e), **empty}
 
 
+def query_kg_chunks(item_names: List[str], query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    按产品名与问题文本检索知识图谱，返回相关切片（按相关度降序）
+
+    三步：
+    1. **种子**：实体名直接出现在问题里的实体（`$q CONTAINS e.name`）
+    2. **扩展**：种子的一跳邻居——这是图相对纯向量检索的价值所在
+    3. **挂载**：把这些实体挂到的切片收上来，按权重累加后排序。
+       权重 = 种子 2 / 邻居 1，再除以 `sqrt(该实体出现在几个切片里)` 做**逆文档频率打折**
+       ——否则「烫金机」这类出现在几十个切片里的泛实体，会让含一堆泛实体的切片
+       盖过真正精准的切片（实测确实会跑偏，「产品简介」压过「安装烫金膜盒」）
+
+    按 `item_name` 跨文档查：图谱虽然按 file_title 隔离**写入**，
+    但查询应按产品**聚合**（同一产品可能有多篇文档）。
+
+    只返回 chunk_id，正文由调用方回 Milvus 取——图谱的 Chunk 节点不存 content。
+
+    :param item_names: 已确认的产品名列表
+    :param query: 改写后的问题
+    :param limit: 最多返回多少个切片
+    :return: [{"chunk_id": str, "score": float, "via": [实体名]}]
+             无命中或 Neo4j 不可用时返回空列表（图谱是补充召回，不该让整条链路失败）
+    """
+    if not item_names or not query:
+        return []
+
+    try:
+        with get_neo4j_driver().session() as session:
+            seeds = [r["name"] for r in session.run(_QUERY_KG_SEEDS, items=item_names, q=query)]
+            if not seeds:
+                logger.info("[Neo4j] 问题中没有命中任何图谱实体，图谱这一路不参与")
+                return []
+
+            neighbors = [
+                r["name"] for r in session.run(
+                    _QUERY_KG_NEIGHBORS, items=item_names, seeds=seeds
+                )
+            ]
+            # 种子权重高于邻居；同名以种子为准
+            weight = {name: KG_SEED_WEIGHT for name in seeds}
+            for name in neighbors:
+                weight.setdefault(name, KG_NEIGHBOR_WEIGHT)
+
+            rows = list(session.run(
+                _QUERY_KG_CHUNKS, items=item_names, names=list(weight.keys())
+            ))
+    except Exception as e:
+        logger.warning(f"[Neo4j] 图谱检索失败，这一路不参与：{e}")
+        return []
+
+    scores: Dict[str, float] = {}
+    via: Dict[str, set] = {}
+    for row in rows:
+        entity = row["entity"]
+        # 逆文档频率打折：像「烫金机」这种出现在几十个切片里的泛实体贡献要小，
+        # 「安装烫金膜盒」这种只出现在少数切片里的具体实体贡献要大。
+        # 用 1/df 而不是 1/sqrt(df)：泛实体数量多，sqrt 的折扣压不住——
+        # 实测「产品简介」（靠 5 个泛实体堆分）仍会压过「安装烫金膜盒」所在的切片。
+        weight_of = weight.get(entity, KG_NEIGHBOR_WEIGHT) / max(int(row["df"]), 1)
+        for chunk_id in row["chunk_ids"]:
+            cid = str(chunk_id)
+            scores[cid] = scores.get(cid, 0.0) + weight_of
+            via.setdefault(cid, set()).add(entity)
+
+    # 分数降序；同分按 chunk_id 排，保证结果稳定
+    ranked = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    result = [
+        {"chunk_id": chunk_id, "score": score, "via": sorted(via[chunk_id])}
+        for chunk_id, score in ranked
+    ]
+    logger.info(
+        f"[Neo4j] 图谱检索：种子实体 {len(seeds)} 个、邻居 {len(neighbors)} 个，"
+        f"命中切片 {len(scores)} 个，取前 {len(result)} 个"
+    )
+    return result
+
+
 if __name__ == '__main__':
     """
     本地测试：连通性 → 建约束 → 写入假图谱 → 校验幂等 → 清理
@@ -407,6 +517,29 @@ if __name__ == '__main__':
         if not any(e["source"] == "装入烫金膜盒" and e["target"] == "烫金膜盒"
                    for e in g["edges"]):
             problems.append("读回的关系里缺「装入烫金膜盒 → 烫金膜盒」")
+
+    # 检索侧查询：种子实体 + 一跳邻居
+    hits = query_kg_chunks(["测试产品"], "烫金膜盒怎么安装？")
+    logger.info(f"[测试] 图谱检索命中 {len(hits)} 个切片：{[(h['chunk_id'], h['score']) for h in hits]}")
+    if not hits:
+        problems.append("query_kg_chunks 没有命中任何切片")
+    else:
+        # 测试数据里 烫金膜盒 挂 kgtest_1/kgtest_2，装入烫金膜盒 挂 kgtest_1，两者有 REL 相连；
+        # 问题只含「烫金膜盒」，故它是种子、另一个是邻居。
+        # 被两个实体同时命中的 kgtest_1 应排在只被种子命中的 kgtest_2 之前。
+        if hits[0]["chunk_id"] != "kgtest_1":
+            problems.append(f"检索排序不对：Top1 应为 kgtest_1，实际 {hits[0]['chunk_id']}")
+        if not any(h["chunk_id"] == "kgtest_2" for h in hits):
+            problems.append("kgtest_2 也应被召回（种子实体挂载过它）")
+        via = {h["chunk_id"]: h["via"] for h in hits}
+        if "装入烫金膜盒" not in via.get("kgtest_1", []):
+            problems.append("kgtest_1 应经由种子与邻居两个实体命中")
+
+    # 问题里没有实体名 / 没有产品名时，应返回空而不是报错或返回全量
+    if query_kg_chunks(["测试产品"], "今天天气怎么样"):
+        problems.append("问题不含实体名时不应有命中")
+    if query_kg_chunks([], "烫金膜盒"):
+        problems.append("item_names 为空时应返回空")
 
     # 清理
     del_res = delete_doc_graph(TEST_FILE)

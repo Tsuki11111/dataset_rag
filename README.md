@@ -91,7 +91,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 检索链路 —— 部分完成 🚧
 
-8 个节点已完成 6 个，其余 1 个是骨架 + 1 个半成品。
+8 个节点已完成 7 个，只剩 `node_answer_output` 一个半成品。
 
 | 节点 | 状态 | 说明 |
 |---|---|---|
@@ -99,7 +99,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 | `node_search_embedding` | ✅ | 改写问题 → 向量化 → `dense_search`（带 `item_name` 过滤）→ `embedding_chunks`；单节点实测 Top1 0.64 |
 | `node_search_embedding_hyde` | ✅ | LLM 生成假设文档 → 「问题+假设文档」向量化 → 检索 → `hyde_embedding_chunks` + `hyde_doc`；单节点实测 Top1 0.71 |
 | `node_web_search_mcp` | ✅ | 异步调百炼 MCP 增强搜索（工具 `search_pro`）→ `web_search_docs`；图内实测返回 5 条 |
-| `node_query_kg` | ⬜ | 骨架。它依赖的 Neo4j 已就位、图里已有数据（见「导入链路」的 `node_import_kg`），待实现查询 |
+| `node_query_kg` | ✅ | 图谱检索：问题里的实体 → 种子 + 一跳邻居 → 取回切片（正文回 Milvus 取）；图内实测召回 5 条，4 条进 RRF |
 | `node_rrf` | ✅ | 加权 RRF 融合切片类召回（基线 / HyDE / 图谱，k=60）→ `rrf_chunks`；图内实测 5+5 输入去重融合为 6 条 |
 | `node_rerank` | ✅ | 合并本地切片 + 联网结果为统一格式 → DashScope 重排打分 → 动态 Top-K（断崖截断）→ `reranked_docs`；图内实测 6+5 输入输出 8 条 |
 | `node_answer_output` | 🚧 | SSE 流式推送与历史存档已完成；**答案内容仍是占位文本**，未接 LLM 生成 |
@@ -113,8 +113,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 未开始 ⬜
 
-- 图谱检索（`node_query_kg` 仍是骨架，但导入侧建图已完成，图里已有真实数据）
-- 答案生成（`node_answer_output` 仍输出占位文本）
+- 答案生成（`node_answer_output` 仍输出占位文本，这是最后一块）
 
 ---
 
@@ -334,6 +333,13 @@ docker compose -f docker/neo4j-compose.yml up -d
 
 另外两点渲染取舍：**切片不作为节点画进图**（84 个切片会把 257 个实体淹没），改为悬停实体时用 tooltip 告知它出现在几个切片里；**标签默认不显示**，只在悬停与缩放 ≥1.5 倍时出现，否则 257 个中文标签必然糊成一团。
 
+**图谱检索只回 chunk_id，正文回 Milvus 取**
+图谱的 `:Chunk` 节点只存 chunk_id 与标题、**不存正文**——正文留在 Milvus。这样图谱不必重复存一份文本，代价是查询时多一次 Milvus 批量取（用的正是 `fetch_chunks_by_chunk_ids`，它本来就是为「只有 chunk_id 没有文本」的场景准备的）。
+
+查询策略是「**种子 + 一跳邻居**」：问题里直接出现的实体名作种子（权重 2），种子的一跳邻居作扩展（权重 1），再按实体 df 打折。一跳扩展正是图相对纯向量检索的价值——能捞到语义上并不相似、但通过关系关联的切片。
+
+值得留意的是，打分里的 df 取自图谱，反映的是**抽取覆盖度**而非真实词频，所以它作为「特异性」信号并不可靠。试过 `1/√df` 与 `1/df`，都无法让排序完全精确。但在当前架构下这可以接受：**RRF 只按排名融合**（rank 1 与 rank 2 的贡献差不到千分之一），真正的精度由下游重排按正文语义决定，图谱这一路的价值在于**把正确切片捞进候选集**——实测确实做到了。
+
 **知识图谱按文档隔离，不做跨文档实体合并**
 每个 `Entity` / `Chunk` 都带 `file_title`，同一实体出现在两篇文档里就是两个节点。这牺牲了跨文档的实体归并，换来的是**清理简单且安全**——一条 `MATCH (n) WHERE n.file_title = $ft DETACH DELETE n` 就够，不会误删其他文档。这和 Milvus 幂等清理只按 `file_title` 是同一条原则。
 
@@ -355,7 +361,7 @@ Milvus 每次重新入库都会生成**全新的 chunk_id**，重复导入时旧
 
 | 项 | 说明 |
 |---|---|
-| 检索节点为骨架 | `node_query_kg` 只有 `sleep` + 返回空列表，走完分支 A 后它那一路拿不到真实结果 |
+| 图谱侧排序只是近似 | `node_query_kg` 按「种子实体权重 2 / 一跳邻居 1，再除以 df」打分，但 **df 反映的是抽取覆盖度而非真实词频**（`HAK 180` 只被抽到 2 个切片里），所以排序不精确。好在 RRF 只看排名、精度由下游重排决定——图内实测正确的切片都进了候选集 |
 | 自带图测试场景1恒失败 | `main_graph.py` 的 `__main__` 拿「烫金膜盒怎么安装？」（不带型号）当查询，产品名确认必然判拒识，四路检索全被跳过。这是既有缺陷，与该测试想验证的图拓扑无关；换成完整产品名即可通过 |
 | 答案仍是占位文本 | `node_answer_output` 在 `state['answer']` 为空时输出固定的演示文本，未接 LLM 生成；`image_urls` 也还是硬编码的 `example.com` |
 | `get_recent_messages` 曾取错数据 | 原实现 `sort(ASCENDING).limit(N)` 取的是**最旧** N 条，已修为倒序取再反转为正序 |
