@@ -1,12 +1,424 @@
+"""
+Neo4j 客户端与知识图谱读写工具
+
+图谱结构（导入侧 node_import_kg 写入，将来检索侧 node_query_kg 读取）：
+    (:Entity {name, type, item_name, file_title})
+    (:Chunk  {chunk_id, title, parent_title, item_name, file_title})
+    (:Entity)-[:APPEARS_IN]->(:Chunk)
+    (:Entity)-[r:REL {type, file_title}]->(:Entity)
+
+两个必须遵守的约定：
+
+1. **每个 Entity / Chunk 都带 file_title，不存在跨文档共享节点。**
+   这是 delete_doc_graph 用 DETACH DELETE 不会误删其他文档的全部依据。
+   将来若要做跨文档实体合并，这套清理会立刻失效，必须同步改成「按文档记录拥有关系再删」。
+
+2. **关系类型是 :REL 上的 `type` 属性，不是关系标签。**
+   Cypher 无法参数化关系标签，拼字符串既有注入风险又无法约束取值范围，
+   所以统一用单标签 + 属性，取值在 Python 侧按白名单兜底。
+"""
 import os
+from typing import Any, Dict, List
+
 from neo4j import GraphDatabase
 
-_neo4j_driver = None    
-def get_neo4j_driver() -> GraphDatabase:
+from app.core.logger import logger
+
+# 实体类型白名单；LLM 越界的取值会被兜底成「其他」
+ENTITY_TYPES = ("部件", "操作", "故障", "参数", "其他")
+# 关系类型白名单；同上
+RELATION_TYPES = ("组成", "导致", "解决", "使用", "连接", "参数属于", "其他")
+
+_driver = None
+
+
+def get_neo4j_driver():
+    """获取 Neo4j 驱动实例（单例）"""
+    global _driver
+    if _driver is None:
+        _driver = GraphDatabase.driver(
+            os.getenv("NEO4J_URI"),
+            auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD")),
+        )
+    return _driver
+
+
+# ========================
+# 约束与索引
+# ========================
+_SCHEMA_STATEMENTS = (
+    "CREATE CONSTRAINT entity_key IF NOT EXISTS FOR (n:Entity) REQUIRE (n.name, n.file_title) IS UNIQUE",
+    "CREATE CONSTRAINT chunk_key IF NOT EXISTS FOR (n:Chunk) REQUIRE n.chunk_id IS UNIQUE",
+    "CREATE INDEX entity_file_title IF NOT EXISTS FOR (n:Entity) ON (n.file_title)",
+    "CREATE INDEX chunk_file_title IF NOT EXISTS FOR (n:Chunk) ON (n.file_title)",
+)
+
+
+# ========================
+# Cypher：清理
+# ========================
+# 先单独删关系：REL 自带 file_title，即使将来某个端点变成共享节点也能清干净
+_DELETE_RELATIONS = "MATCH ()-[r:REL]->() WHERE r.file_title = $ft DELETE r"
+# DETACH DELETE 会一并带走该节点的所有边，无残留
+_DELETE_NODES = "MATCH (n) WHERE n.file_title = $ft DETACH DELETE n"
+
+
+# ========================
+# Cypher：写入
+# ========================
+# Chunk 只按 chunk_id 做 key（它是 Milvus 自增主键，全局唯一），file_title 走 SET
+_WRITE_CHUNKS = """
+UNWIND $chunks AS c
+MERGE (k:Chunk {chunk_id: c.chunk_id})
+SET k.title = c.title, k.parent_title = c.parent_title,
+    k.file_title = $ft, k.item_name = $item
+"""
+
+_WRITE_ENTITIES = """
+UNWIND $entities AS e
+MERGE (n:Entity {name: e.name, file_title: $ft})
+ON CREATE SET n.type = e.type
+SET n.item_name = $item
+"""
+
+_WRITE_LINKS = """
+UNWIND $links AS l
+MATCH (e:Entity {name: l.name, file_title: $ft})
+MATCH (c:Chunk {chunk_id: l.chunk_id})
+MERGE (e)-[:APPEARS_IN]->(c)
+"""
+
+# MERGE 的 key 必须含 type，否则同一对实体之间只能存下一种关系
+_WRITE_RELATIONS = """
+UNWIND $rels AS r
+MATCH (a:Entity {name: r.src, file_title: $ft})
+MATCH (b:Entity {name: r.dst, file_title: $ft})
+MERGE (a)-[x:REL {type: r.type, file_title: $ft}]->(b)
+"""
+
+
+# ========================
+# Cypher：统计
+# ========================
+_COUNT_STATEMENTS = {
+    "chunks": "MATCH (n:Chunk {file_title: $ft}) RETURN count(n) AS c",
+    "entities": "MATCH (n:Entity {file_title: $ft}) RETURN count(n) AS c",
+    "links": (
+        "MATCH (:Entity {file_title: $ft})-[:APPEARS_IN]->(:Chunk {file_title: $ft}) "
+        "RETURN count(*) AS c"
+    ),
+    "relations": (
+        "MATCH (:Entity {file_title: $ft})-[r:REL]->(:Entity {file_title: $ft}) "
+        "RETURN count(r) AS c"
+    ),
+}
+
+
+# ========================
+# Cypher：读取图谱（供前端可视化）
+# ========================
+# 切片不画进图：84 个切片节点会把 257 个实体淹没，只把「出现在几个切片里」挂在实体上
+_READ_GRAPH_NODES = """
+MATCH (e:Entity {file_title: $ft})
+OPTIONAL MATCH (e)-[:APPEARS_IN]->(c:Chunk {file_title: $ft})
+RETURN e.name AS name, e.type AS type, count(DISTINCT c) AS chunk_count
+"""
+
+_READ_GRAPH_EDGES = """
+MATCH (a:Entity {file_title: $ft})-[r:REL]->(b:Entity {file_title: $ft})
+RETURN a.name AS source, b.name AS target, r.type AS type
+"""
+
+
+def is_neo4j_available() -> bool:
     """
-    获取 Neo4j 驱动实例
+    探测 Neo4j 是否可用（导入侧的前置检查）
+
+    图谱是补充召回，Neo4j 挂掉不该让整篇文档导入失败，所以调用方先用它探一下。
+    :return: 可用返回 True
     """
-    global _neo4j_driver
-    if _neo4j_driver is None:
-        _neo4j_driver = GraphDatabase.driver(os.getenv("NEO4J_URI"), auth=(os.getenv("NEO4J_USERNAME"), os.getenv("NEO4J_PASSWORD")))
-    return _neo4j_driver
+    try:
+        get_neo4j_driver().verify_connectivity()
+        return True
+    except Exception as e:
+        logger.warning(f"[Neo4j] 连接不可用：{e}")
+        return False
+
+
+def ensure_neo4j_schema() -> bool:
+    """建唯一约束与索引（幂等，全部 IF NOT EXISTS）"""
+    try:
+        with get_neo4j_driver().session() as session:
+            for stmt in _SCHEMA_STATEMENTS:
+                session.run(stmt)
+        logger.info("[Neo4j] 约束与索引已就绪")
+        return True
+    except Exception as e:
+        logger.error(f"[Neo4j] 建约束失败：{e}", exc_info=True)
+        return False
+
+
+def _count_doc_graph_tx(tx, file_title: str) -> Dict[str, int]:
+    """在事务内统计某文档的图谱规模"""
+    stats = {}
+    for key, cypher in _COUNT_STATEMENTS.items():
+        record = tx.run(cypher, ft=file_title).single()
+        stats[key] = record["c"] if record else 0
+    return stats
+
+
+def _delete_doc_graph_tx(tx, file_title: str) -> Dict[str, int]:
+    """在事务内清理某文档的图谱数据，返回清理前的计数便于对账"""
+    before = _count_doc_graph_tx(tx, file_title)
+    tx.run(_DELETE_RELATIONS, ft=file_title)
+    tx.run(_DELETE_NODES, ft=file_title)
+    return before
+
+
+def _write_doc_graph_tx(
+        tx,
+        file_title: str,
+        item_name: str,
+        chunks: List[Dict[str, Any]],
+        entities: List[Dict[str, Any]],
+        links: List[Dict[str, Any]],
+        rels: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """在事务内先清理后写入，最后回读实际数量"""
+    # 必须先清：重复导入时 Milvus 会生成全新的 chunk_id，
+    # 旧 Chunk 节点带的是失效 id，APPEARS_IN 会变成指向幽灵切片的悬空边
+    tx.run(_DELETE_RELATIONS, ft=file_title)
+    tx.run(_DELETE_NODES, ft=file_title)
+
+    if chunks:
+        tx.run(_WRITE_CHUNKS, chunks=chunks, ft=file_title, item=item_name)
+    if entities:
+        tx.run(_WRITE_ENTITIES, entities=entities, ft=file_title, item=item_name)
+    if links:
+        tx.run(_WRITE_LINKS, links=links, ft=file_title)
+    if rels:
+        tx.run(_WRITE_RELATIONS, rels=rels, ft=file_title)
+
+    # 回读实际写入量：端点 MATCH 不到会静默丢边，调用方需要拿它对账
+    return _count_doc_graph_tx(tx, file_title)
+
+
+def write_doc_graph(
+        file_title: str,
+        item_name: str,
+        chunks: List[Dict[str, Any]],
+        entities: List[Dict[str, Any]],
+        links: List[Dict[str, Any]],
+        rels: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    写入一份文档的图谱（先清理后写入，单事务）
+
+    :param file_title: 文档名，本图谱的隔离与清理依据
+    :param item_name: 产品主体名，作为实体的属性（不做节点）
+    :param chunks: [{"chunk_id","title","parent_title"}]
+    :param entities: [{"name","type"}]
+    :param links: [{"name","chunk_id"}] 实体挂载到切片
+    :param rels: [{"src","dst","type"}] 实体间关系
+    :return: {"ok", "stats"} 或 {"ok": False, "error"}
+    """
+    try:
+        with get_neo4j_driver().session() as session:
+            stats = session.execute_write(
+                _write_doc_graph_tx, file_title, item_name, chunks, entities, links, rels
+            )
+        logger.info(f"[Neo4j] 文档[{file_title}]图谱写入完成：{stats}")
+        return {"ok": True, "stats": stats}
+    except Exception as e:
+        logger.error(f"[Neo4j] 文档[{file_title}]图谱写入失败：{e}", exc_info=True)
+        return {"ok": False, "error": str(e)}
+
+
+def delete_doc_graph(file_title: str) -> Dict[str, Any]:
+    """
+    删除某文档在 Neo4j 里的全部痕迹（供文档撤回调用）
+
+    :param file_title: 文档名
+    :return: {"ok", "deleted", "detail"}
+    """
+    try:
+        with get_neo4j_driver().session() as session:
+            before = session.execute_write(_delete_doc_graph_tx, file_title)
+        logger.info(f"[Neo4j] 已清理文档[{file_title}]的图谱数据：{before}")
+        return {"ok": True, "deleted": sum(before.values()), "detail": before}
+    except Exception as e:
+        logger.error(f"[Neo4j] 清理文档[{file_title}]图谱失败：{e}", exc_info=True)
+        return {"ok": False, "deleted": 0, "error": str(e)}
+
+
+def count_graph_by_file_titles(file_titles: List[str]) -> Dict[str, Dict[str, int]]:
+    """
+    批量统计多个文档的图谱规模（供 GET /documents 展示，不用开 Neo4j Browser）
+
+    :param file_titles: 文档名列表
+    :return: {file_title: {"entities": n, "chunks": n}}；查询失败返回空字典
+    """
+    if not file_titles:
+        return {}
+    try:
+        with get_neo4j_driver().session() as session:
+            result = session.run(
+                """
+                UNWIND $titles AS ft
+                OPTIONAL MATCH (e:Entity {file_title: ft})
+                WITH ft, count(e) AS entities
+                OPTIONAL MATCH (c:Chunk {file_title: ft})
+                RETURN ft AS file_title, entities, count(c) AS chunks
+                """,
+                titles=file_titles,
+            )
+            return {
+                r["file_title"]: {"entities": r["entities"], "chunks": r["chunks"]}
+                for r in result
+            }
+    except Exception as e:
+        # 图谱统计只是列表页的附加信息，查不到就不显示，不能让接口整个失败
+        logger.warning(f"[Neo4j] 统计文档图谱失败，将不展示图谱信息：{e}")
+        return {}
+
+
+def read_doc_graph(file_title: str) -> Dict[str, Any]:
+    """
+    读取一份文档的实体-关系图（供前端可视化）
+
+    切片不作为节点返回，只把「出现在几个切片里」记在实体上——
+    84 个切片节点会把 257 个实体淹没，图就没法看了。
+
+    实体 name 在 (name, file_title) 唯一约束下文档内唯一，可直接当图节点 id 使用。
+
+    :param file_title: 文档名
+    :return: {"available": bool, "nodes": [...], "edges": [...], "stats": {...}}
+             available=False 表示 Neo4j 不可用或该文档没有图谱数据
+    """
+    empty = {"nodes": [], "edges": [], "stats": {"entities": 0, "relations": 0, "chunks": 0}}
+
+    if not file_title:
+        return {"available": False, "error": "file_title 为空", **empty}
+
+    try:
+        with get_neo4j_driver().session() as session:
+            nodes = [dict(r) for r in session.run(_READ_GRAPH_NODES, ft=file_title)]
+            edges = [dict(r) for r in session.run(_READ_GRAPH_EDGES, ft=file_title)]
+            chunk_row = session.run(_COUNT_STATEMENTS["chunks"], ft=file_title).single()
+
+        return {
+            "available": True,
+            "nodes": nodes,
+            "edges": edges,
+            "stats": {
+                "entities": len(nodes),
+                "relations": len(edges),
+                # 切片总数单独查，别拿节点返回值拼
+                "chunks": chunk_row["c"] if chunk_row else 0,
+            },
+        }
+    except Exception as e:
+        logger.warning(f"[Neo4j] 读取文档[{file_title}]图谱失败：{e}")
+        return {"available": False, "error": str(e), **empty}
+
+
+if __name__ == '__main__':
+    """
+    本地测试：连通性 → 建约束 → 写入假图谱 → 校验幂等 → 清理
+
+    前置：docker compose -f docker/neo4j-compose.yml up -d
+    """
+    logger.info("=" * 70)
+    logger.info("[测试] 开始验证 Neo4j 图谱读写")
+
+    TEST_FILE = "kg_util_测试文档"
+    problems = []
+
+    if not is_neo4j_available():
+        logger.error("[测试] [FAIL] Neo4j 不可用，请先启动容器")
+        raise SystemExit(1)
+    logger.info("[测试] 连通性正常")
+
+    if not ensure_neo4j_schema():
+        raise SystemExit("[测试] [FAIL] 建约束失败")
+
+    chunks = [
+        {"chunk_id": "kgtest_1", "title": "## 装入烫金膜盒", "parent_title": "# 操作"},
+        {"chunk_id": "kgtest_2", "title": "## 更换电池", "parent_title": "# 维护"},
+    ]
+    entities = [{"name": "烫金膜盒", "type": "部件"}, {"name": "装入烫金膜盒", "type": "操作"}]
+    links = [{"name": "烫金膜盒", "chunk_id": "kgtest_1"},
+             {"name": "装入烫金膜盒", "chunk_id": "kgtest_1"},
+             {"name": "烫金膜盒", "chunk_id": "kgtest_2"}]
+    rels = [{"src": "装入烫金膜盒", "dst": "烫金膜盒", "type": "使用"}]
+
+    def run_once(round_name: str) -> Dict[str, int]:
+        res = write_doc_graph(TEST_FILE, "测试产品", chunks, entities, links, rels)
+        if not res.get("ok"):
+            problems.append(f"{round_name} 写入失败：{res.get('error')}")
+            return {}
+        return res["stats"]
+
+    first = run_once("第一次")
+    logger.info(f"[测试] 第一次写入：{first}")
+
+    # 幂等：同一份数据再写一次，数量不应翻倍
+    second = run_once("第二次")
+    logger.info(f"[测试] 第二次写入：{second}")
+
+    if first != second:
+        problems.append(f"重复写入数量不一致（幂等失败）：{first} != {second}")
+    if first.get("chunks") != len(chunks):
+        problems.append(f"Chunk 数不符：{first.get('chunks')} != {len(chunks)}")
+    if first.get("entities") != len(entities):
+        problems.append(f"Entity 数不符：{first.get('entities')} != {len(entities)}")
+    if first.get("links") != len(links):
+        problems.append(f"挂载边数不符：{first.get('links')} != {len(links)}")
+    if first.get("relations") != len(rels):
+        problems.append(f"关系数不符：{first.get('relations')} != {len(rels)}")
+
+    # 批量统计
+    counts = count_graph_by_file_titles([TEST_FILE, "不存在的文档"])
+    logger.info(f"[测试] 批量统计：{counts}")
+    if counts.get(TEST_FILE, {}).get("entities") != len(entities):
+        problems.append("批量统计的实体数不对")
+
+    # 读回图谱（前端可视化接口依赖它）
+    g = read_doc_graph(TEST_FILE)
+    logger.info(
+        f"[测试] 读回图谱：available={g['available']} 节点={len(g['nodes'])} "
+        f"边={len(g['edges'])} stats={g['stats']}"
+    )
+    if not g["available"]:
+        problems.append(f"read_doc_graph 返回不可用：{g.get('error')}")
+    else:
+        if g["stats"]["entities"] != len(entities):
+            problems.append(f"读回实体数不符：{g['stats']['entities']} != {len(entities)}")
+        if g["stats"]["relations"] != len(rels):
+            problems.append(f"读回关系数不符：{g['stats']['relations']} != {len(rels)}")
+        if g["stats"]["chunks"] != len(chunks):
+            problems.append(f"读回切片数不符：{g['stats']['chunks']} != {len(chunks)}")
+        node = next((n for n in g["nodes"] if n["name"] == "烫金膜盒"), None)
+        if node is None:
+            problems.append("读回的节点里找不到「烫金膜盒」")
+        elif node["chunk_count"] != 2:
+            # 测试数据里「烫金膜盒」挂在 kgtest_1 与 kgtest_2 两个切片上
+            problems.append(f"chunk_count 不符：{node['chunk_count']} != 2")
+        if not any(e["source"] == "装入烫金膜盒" and e["target"] == "烫金膜盒"
+                   for e in g["edges"]):
+            problems.append("读回的关系里缺「装入烫金膜盒 → 烫金膜盒」")
+
+    # 清理
+    del_res = delete_doc_graph(TEST_FILE)
+    logger.info(f"[测试] 清理结果：{del_res}")
+    if not del_res.get("ok"):
+        problems.append(f"清理失败：{del_res.get('error')}")
+    after = count_graph_by_file_titles([TEST_FILE]).get(TEST_FILE, {})
+    if after.get("entities") or after.get("chunks"):
+        problems.append(f"清理后仍有残留：{after}")
+
+    for p in problems:
+        logger.error(f"[测试] [FAIL] {p}")
+    if not problems:
+        logger.success("[测试] [PASS] Neo4j 图谱读写验证通过（含幂等与清理）")
+    logger.info("=" * 70)

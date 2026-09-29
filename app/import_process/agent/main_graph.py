@@ -7,6 +7,7 @@ from app.import_process.agent.nodes.node_item_name_recognition import node_item_
 from app.import_process.agent.nodes.node_dashscope_embedding import node_dashscope_embedding
 from app.import_process.agent.nodes.node_document_split import node_document_split
 from app.import_process.agent.nodes.node_entry import node_entry
+from app.import_process.agent.nodes.node_import_kg import node_import_kg
 from app.import_process.agent.nodes.node_import_milvus import node_import_milvus
 from app.import_process.agent.nodes.node_md_img import node_md_img
 from app.import_process.agent.nodes.node_pdf_to_md import node_pdf_to_md
@@ -24,6 +25,8 @@ workflow.add_node("node_document_split",node_document_split)
 workflow.add_node("node_item_name_recognition",node_item_name_recognition)
 workflow.add_node("node_dashscope_embedding",node_dashscope_embedding)
 workflow.add_node("node_import_milvus",node_import_milvus)
+# 图谱构建依赖 Milvus 回填的 chunk_id，所以必须排在 node_import_milvus 之后
+workflow.add_node("node_import_kg",node_import_kg)
 
 # 设置入口节点
 workflow.set_entry_point("node_entry")
@@ -60,7 +63,8 @@ workflow.add_edge("node_md_img", "node_document_split")
 workflow.add_edge("node_document_split", "node_item_name_recognition")
 workflow.add_edge("node_item_name_recognition", "node_dashscope_embedding")
 workflow.add_edge("node_dashscope_embedding", "node_import_milvus")
-workflow.add_edge("node_import_milvus", END)
+workflow.add_edge("node_import_milvus", "node_import_kg")
+workflow.add_edge("node_import_kg", END)
 # 编译节点
 kb_import_app = workflow.compile()
 

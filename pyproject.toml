@@ -16,6 +16,7 @@ dependencies = [
     # 由 openai-agents 间接依赖，故在此显式钉版本。
     "mcp<2",
     "minio>=7.2.20",
+    "neo4j>=6.3.1",
     "openai-agents>=0.20.0",
     "pymilvus>=3.0.1",
     "pymilvus-model>=0.3.2",

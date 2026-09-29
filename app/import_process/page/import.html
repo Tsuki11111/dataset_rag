@@ -397,6 +397,9 @@
   /* ============================================================
      已导入文档表
      ============================================================ */
+  /* 窗口很窄时表格可能宽于容器（操作列 nowrap 后不再换行），
+     让它在卡片内横向滚动，而不是撑破布局 */
+  #docList { overflow-x: auto; }
   table.docs { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.docs th {
     text-align: left; font-weight: 500; color: var(--ink-dim);
@@ -410,7 +413,9 @@
   table.docs tbody tr:hover td { background: var(--accent-soft); }
   td.docname { font-weight: 500; }
   td.num { color: var(--ink-dim); white-space: nowrap; font-family: var(--font-mono); font-size: 12px; }
-  td.act { text-align: right; }
+  /* 操作列：white-space:nowrap 防止两个按钮换行堆叠；width:1% 让该列按内容收窄，
+     把宽度让给文档名那一列 */
+  td.act { text-align: right; white-space: nowrap; width: 1%; }
 
   .revoke-result {
     margin-top: 14px; padding: 13px 15px; border-radius: var(--r-md); font-size: 13px;
@@ -442,6 +447,33 @@
     transition: color .18s, border-color .18s;
   }
   button.plain:hover { color: var(--ink); border-color: var(--line-strong); }
+
+  /* 图谱按钮：与撤回按钮同尺寸，但用强调色 */
+  button.kg-btn {
+    background: none; color: var(--accent); border: 1px solid var(--accent);
+    padding: 4px 12px; border-radius: var(--r-sm); font-size: 12px; cursor: pointer;
+    white-space: nowrap; transition: background .18s; margin-right: 16px;
+  }
+  button.kg-btn:hover:not(:disabled) { background: var(--accent-soft); }
+
+  /* 知识图谱面板 */
+  .kg-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .kg-bar input { max-width: 200px; }
+  #kgChips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .kg-chip {
+    background: none; border: 1px solid var(--line); color: var(--ink-dim);
+    border-radius: 999px; padding: 3px 11px; font-size: 12px; cursor: pointer;
+    transition: color .18s, border-color .18s, background .18s;
+  }
+  .kg-chip:hover { border-color: var(--line-strong); }
+  .kg-chip.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+  #kgChart { width: 100%; height: 520px; }
+  .kg-fallback { color: var(--ink-dim); font-size: 13px; line-height: 1.9; }
+  .kg-fallback b { color: var(--ink); }
+  .kg-fallback ul { margin: 8px 0 0 18px; padding: 0; }
+  .kg-fallback li { margin: 2px 0; }
+  .kg-hint { color: var(--ink-dim); font-size: 12px; margin-top: 8px; }
+  @media (max-width: 720px) { #kgChart { height: 380px; } }
 
   .empty { color: var(--ink-dim); font-size: 13px; }
   .hidden { display: none !important; }
@@ -553,6 +585,27 @@
     </div>
   </div>
 
+  <!-- 知识图谱：点文档行的「图谱」按钮后展示该文档的实体-关系图 -->
+  <div class="card hidden" id="kgPanel">
+    <div class="card-head">
+      <h2><span class="dot"></span>知识图谱 · <span id="kgTitle"></span></h2>
+      <span class="spacer"></span>
+      <span class="empty" id="kgCount"></span>
+      <button class="refresh" id="kgClose" title="关闭" aria-label="关闭">✕</button>
+    </div>
+    <div class="card-body">
+      <div class="kg-bar">
+        <input id="kgSearch" class="revoke-input" placeholder="搜索实体…">
+        <div id="kgChips"></div>
+      </div>
+      <div id="kgChart"></div>
+      <div id="kgFallback" class="hidden"></div>
+      <div class="kg-hint" id="kgHint">
+        滚轮缩放、拖拽移动；悬停节点看类型与关联切片数，放大到 1.5 倍后显示全部名称
+      </div>
+    </div>
+  </div>
+
 </div>
 </main>
 
@@ -567,6 +620,8 @@ $('themeBtn').onclick = () => {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = next;
   try { localStorage.setItem('kb-theme', next); } catch (e) {}
+  // 图的配色取自 CSS 变量，切主题后要重绘才跟得上
+  if (!$('kgPanel').classList.contains('hidden')) renderKg();
 };
 
 /* ---------- 连接状态 ---------- */
@@ -899,6 +954,7 @@ function renderDocTable(docs) {
           <td class="num">${x.chunk_count}</td>
           <td class="num">${esc(x.imported_at || '—')}</td>
           <td class="act">
+            <button class="kg-btn" data-title="${esc(x.file_title)}">图谱</button>
             <button class="danger" data-title="${esc(x.file_title)}">撤回</button>
           </td>
         </tr>`).join('')}
@@ -907,7 +963,253 @@ function renderDocTable(docs) {
   box.querySelectorAll('.danger').forEach(b => {
     b.onclick = () => revokeFlow(b.dataset.title);
   });
+  box.querySelectorAll('.kg-btn').forEach(b => {
+    b.onclick = () => openKg(b.dataset.title);
+  });
 }
+
+/* ---------- 知识图谱 ---------- */
+const KG_TYPES = ['部件', '操作', '故障', '参数', '其他'];
+const KG_PALETTE = ['#1C6A5A', '#8F5A0E', '#B23A48', '#3E4640', '#5F695F'];
+// 三条 CDN 均在本机实测可用（同版本同大小），按实测速度排序；staticfile 实测不可用故未收录
+const KG_CDNS = [
+  'https://registry.npmmirror.com/echarts/5.4.3/files/dist/echarts.min.js',
+  'https://cdn.bootcdn.net/ajax/libs/echarts/5.4.3/echarts.min.js',
+  'https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js',
+];
+
+const kg = { title: '', raw: null, chart: null, types: new Set(KG_TYPES), kw: '', labelOn: false };
+
+// 懒加载 + 三源按序回退；缓存在 Promise 上，避免重复请求
+let kgLoading = null;
+function loadECharts() {
+  if (window.echarts) return Promise.resolve(true);
+  if (kgLoading) return kgLoading;
+  kgLoading = KG_CDNS.reduce((chain, url) => chain.catch(() => new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = url; s.async = true;
+    s.onload = () => window.echarts ? res(true) : rej(new Error('empty'));
+    s.onerror = () => rej(new Error(url));
+    document.head.appendChild(s);
+  })), Promise.reject()).catch(() => false);
+  return kgLoading;
+}
+
+// ECharts 不认 CSS 变量，每次渲染现读一次，主题切换后重建即可跟上
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function degreeMap(edges) {
+  const d = {};
+  edges.forEach(e => { d[e.source] = (d[e.source] || 0) + 1; d[e.target] = (d[e.target] || 0) + 1; });
+  return d;
+}
+
+async function openKg(title) {
+  kg.title = title;
+  kg.kw = '';
+  kg.types = new Set(KG_TYPES);
+  kg.raw = null;
+  $('kgTitle').textContent = title;
+  $('kgSearch').value = '';
+  $('kgCount').textContent = '';
+  $('kgPanel').classList.remove('hidden');
+  $('kgChart').classList.remove('hidden');
+  $('kgFallback').classList.add('hidden');
+  // 不能清 #kgChart 的 innerHTML：那会拆掉 ECharts 自己生成的 DOM，
+  // 实例仍持有旧引用，之后再 setOption 会报 removeChild/null。要清就调 chart.clear()
+  if (kg.chart) kg.chart.clear();
+  renderChips();
+  $('kgPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  let data;
+  try {
+    data = await (await fetch('/documents/graph?file_title=' + encodeURIComponent(title))).json();
+  } catch (e) {
+    showKgFallback('读取图谱失败：' + esc(String(e)));
+    return;
+  }
+
+  if (!data.available) {
+    showKgFallback(esc(data.message || 'Neo4j 不可用，无法读取图谱。'));
+    return;
+  }
+  if (!data.nodes || !data.nodes.length) {
+    showKgFallback('该文档还没有图谱数据。它可能是在图谱功能上线前导入的，重新导入一次即可生成。');
+    return;
+  }
+
+  kg.raw = data;
+  renderChips();   // 数据到了才重绘，让每个类型后面带上数量
+  const ok = await loadECharts();
+  if (!ok) {
+    // 考虑到本机环境有代理拦 CDN 的先例：不白屏、不抛异常，改为文字降级
+    showKgFallback('图谱渲染库加载失败（三个 CDN 都未连通，可能是代理或网络拦截）。' +
+      '下面是该文档的关键实体：', kg.raw);
+    return;
+  }
+
+  if (!kg.chart) {
+    kg.chart = echarts.init($('kgChart'));
+    // 缩放达到 1.5 倍才显示全部标签，否则 257 个中文标签会糊成一团
+    kg.chart.on('graphRoam', () => {
+      const opt = kg.chart.getOption();
+      const zoom = (opt.series && opt.series[0] && opt.series[0].zoom) || 1;
+      const want = zoom >= 1.5;
+      if (want !== kg.labelOn) { kg.labelOn = want; renderKg(); }
+    });
+  } else {
+    kg.chart.resize();
+  }
+  renderKg();
+}
+
+function closeKg() {
+  $('kgPanel').classList.add('hidden');
+  $('kgTitle').textContent = '';
+  kg.raw = null;
+}
+
+// CDN 不可用时的降级视图：说明 + 类型分布 + 关联最多的实体
+function showKgFallback(message, data) {
+  $('kgChart').classList.add('hidden');
+  const fb = $('kgFallback');
+  fb.classList.remove('hidden');
+
+  let html = `<b>${message}</b>`;
+  if (data && data.nodes && data.nodes.length) {
+    const deg = degreeMap(data.edges);
+    const relCount = {};
+    data.edges.forEach(e => { relCount[e.type] = (relCount[e.type] || 0) + 1; });
+    const top = [...data.nodes]
+      .sort((a, b) => (deg[b.name] || 0) - (deg[a.name] || 0))
+      .slice(0, 20);
+
+    html += `<div class="kg-hint">共 ${data.nodes.length} 个实体、${data.edges.length} 条关系、${data.stats.chunks} 个切片</div>`;
+    html += `<div class="kg-hint">实体类型：` +
+      KG_TYPES.map(t => `${t} ${data.nodes.filter(n => n.type === t).length}`).join(' · ') + `</div>`;
+    html += `<div class="kg-hint">关系类型：` +
+      Object.entries(relCount).map(([k, v]) => `${k} ${v}`).join(' · ') + `</div>`;
+    html += `<div class="kg-hint">关联最多的实体（前 ${top.length}）：</div><ul>` +
+      top.map(n => `<li>${esc(n.name)}（${esc(n.type)} · ${deg[n.name] || 0} 条关系 · 出现在 ${n.chunk_count} 个切片）</li>`).join('') +
+      `</ul>`;
+  }
+  fb.innerHTML = html;
+}
+
+function renderChips() {
+  const box = $('kgChips');
+  const nodes = (kg.raw && kg.raw.nodes) || [];
+  box.innerHTML = KG_TYPES.map(t => {
+    const n = nodes.length ? nodes.filter(x => x.type === t).length : 0;
+    return `<button class="kg-chip${kg.types.has(t) ? ' on' : ''}" data-type="${esc(t)}">` +
+           `${esc(t)}${nodes.length ? ' ' + n : ''}</button>`;
+  }).join('');
+  box.querySelectorAll('.kg-chip').forEach(b => {
+    b.onclick = () => {
+      const t = b.dataset.type;
+      if (kg.types.has(t)) kg.types.delete(t); else kg.types.add(t);
+      renderChips();
+      renderKg();
+    };
+  });
+}
+
+// 只保留命中节点 + 其一跳邻居，保证边不会悬空
+function filteredGraph() {
+  const kw = $('kgSearch').value.trim();
+  kg.kw = kw;
+  const hit = new Set(
+    kg.raw.nodes.filter(n => kg.types.has(n.type) && (!kw || n.name.includes(kw))).map(n => n.name)
+  );
+  const keep = new Set(hit);
+  for (const e of kg.raw.edges) {
+    if (hit.has(e.source)) keep.add(e.target);
+    if (hit.has(e.target)) keep.add(e.source);
+  }
+  return {
+    nodes: kg.raw.nodes.filter(n => keep.has(n.name)),
+    edges: kg.raw.edges.filter(e => keep.has(e.source) && keep.has(e.target)),
+    hit,
+  };
+}
+
+function buildOption() {
+  const { nodes, edges, hit } = filteredGraph();
+  const deg = degreeMap(edges);
+  const ink = cssVar('--ink'), inkDim = cssVar('--ink-dim');
+  const lineStrong = cssVar('--line-strong'), accent = cssVar('--accent');
+  const searching = !!kg.kw;
+
+  return {
+    backgroundColor: 'transparent',
+    animation: false,
+    color: KG_PALETTE,
+    tooltip: {
+      confine: true,
+      formatter: p => p.dataType === 'edge'
+        ? `${esc(p.data.source)} —${esc(p.data.relType)}→ ${esc(p.data.target)}`
+        : `<b>${esc(p.data.name)}</b><br>类型：${esc(p.data.category)}` +
+          `<br>关联切片：${p.data.chunkCount} 个<br>连接度：${p.data.value}`,
+    },
+    series: [{
+      type: 'graph',
+      layout: 'force',
+      roam: true,
+      draggable: true,
+      scaleLimit: { min: 0.3, max: 4 },
+      top: 8, bottom: 8,
+      label: {
+        show: kg.labelOn, position: 'right', fontSize: 11, color: ink,
+        formatter: p => p.data.name.length > 8 ? p.data.name.slice(0, 8) + '…' : p.data.name,
+      },
+      edgeLabel: { show: false, fontSize: 10, color: inkDim, formatter: p => p.data.relType },
+      emphasis: {
+        focus: 'adjacency',
+        label: { show: true },
+        edgeLabel: { show: true },
+        lineStyle: { width: 2.5, opacity: 1 },
+      },
+      force: {
+        // circular 让首帧就有结构，force 收敛后更稳
+        initLayout: 'circular', repulsion: 320, gravity: 0.08,
+        edgeLength: [60, 160], friction: 0.15, layoutAnimation: true,
+      },
+      lineStyle: { color: lineStrong, width: 1, curveness: 0.12, opacity: 0.55 },
+      edgeSymbol: ['none', 'arrow'],
+      edgeSymbolSize: 6,
+      data: nodes.map(n => ({
+        name: n.name,
+        category: n.type,
+        chunkCount: n.chunk_count,
+        value: deg[n.name] || 0,
+        symbolSize: Math.min(42, 8 + Math.sqrt(deg[n.name] || 0) * 5),
+        // 搜索命中的本体加描边，与「被带出来的一跳邻居」区分
+        itemStyle: (searching && hit.has(n.name))
+          ? { borderColor: accent, borderWidth: 2 } : undefined,
+      })),
+      categories: KG_TYPES.map(t => ({ name: t })),
+      links: edges.map(e => ({ source: e.source, target: e.target, relType: e.type })),
+    }],
+  };
+}
+
+function renderKg() {
+  if (!kg.raw || !kg.chart) return;
+  const { nodes, edges, hit } = filteredGraph();
+  $('kgCount').textContent = hit.size === 0
+    ? '没有匹配的实体'
+    : `显示 ${nodes.length} / ${kg.raw.nodes.length} 实体 · ${edges.length} / ${kg.raw.edges.length} 关系`;
+  kg.chart.setOption(buildOption(), true);
+}
+
+$('kgClose').onclick = closeKg;
+let kgSearchTimer = null;
+$('kgSearch').oninput = () => {
+  clearTimeout(kgSearchTimer);
+  kgSearchTimer = setTimeout(renderKg, 200);
+};
 
 /* 撤回流程：先预览待删内容 → 手动输入文档名确认 → 执行 */
 async function revokeFlow(fileTitle) {
@@ -926,6 +1228,7 @@ async function revokeFlow(fileTitle) {
     <div class="revoke-result">
       <div class="revoke-warn">⚠ 确认撤回「${esc(fileTitle)}」？此操作不可逆</div>
       <div><span class="k">将删除</span>Milvus 中该文档的全部切片与产品名</div>
+      <div><span class="k"></span>Neo4j 中该文档的图谱实体与关系</div>
       <div><span class="k"></span>去重记录（撤回后可重新上传）</div>
       <div><span class="k"></span>MinIO 中该文档的图片与原始文件</div>
       <div><span class="k"></span>本地产物 ${paths.length} 项</div>
@@ -957,6 +1260,8 @@ async function revokeFlow(fileTitle) {
       );
       const d = await r.json();
       const res = d.result || {};
+      // 撤回的正是当前正在看的文档，顺手关掉图谱面板
+      if (res.success && kg.title === fileTitle) closeKg();
       const m = (res.milvus && res.milvus.detail) || {};
       box.innerHTML = `
         <div class="revoke-result">
@@ -965,6 +1270,9 @@ async function revokeFlow(fileTitle) {
           </div>
           <div><span class="k">Milvus 切片</span>删除 ${m.chunks ?? '—'} 条</div>
           <div><span class="k">Milvus 产品名</span>删除 ${m.item_names ?? '—'} 条</div>
+          <div><span class="k">Neo4j 图谱</span>${res.neo4j && res.neo4j.ok
+            ? `删除 ${res.neo4j.detail.entities} 实体 · ${res.neo4j.detail.relations} 关系`
+            : '未清理（Neo4j 不可用）'}</div>
           <div><span class="k">去重记录</span>删除 ${(res.dedup && res.dedup.deleted) ?? '—'} 条</div>
           <div><span class="k">本地产物</span>删除 ${(res.local && res.local.deleted) ?? '—'} 项</div>
           <div><span class="k">MinIO</span>删除 ${(res.minio && res.minio.deleted) ?? '—'} 个对象</div>

@@ -1,16 +1,17 @@
 """
 文档管理工具：列出已导入文档、定位其产物、执行撤回
 
-撤回一份文档需要清理四处数据：
+撤回一份文档需要清理五处数据：
 1. Milvus kb_chunks    —— 该文档的全部切片
 2. Milvus kb_item_names —— 该文档的产品主体名
-3. SQLite imported_documents —— 去重记录（删除后该文件可重新上传）
+3. MongoDB imported_documents —— 去重记录（删除后该文件可重新上传）
 4. 本地 output 目录 + MinIO 对象
+5. Neo4j 知识图谱 —— 该文档的实体、切片与关系
 
 安全原则：
 - 本地路径只做「精确名匹配」，不做模糊匹配，避免误删
-- Milvus 一律按 file_title 过滤，绝不用 item_name：
-  item_name 是主键，若另一文档识别出同名产品会覆盖该行（file_title 随之改变），
+- Milvus / Neo4j 一律按 file_title 过滤，绝不用 item_name：
+  item_name 是主键或 LLM 输出，若另一文档识别出同名产品会覆盖该行（file_title 随之改变），
   按 item_name 删会把已经属于别的文档的记录删掉
 - 逐项独立 try/except，单点失败不中断整体，最后汇总报告
 """
@@ -25,6 +26,7 @@ from minio.deleteobjects import DeleteObject
 from app.clients.milvus_utils import get_milvus_client
 from app.clients.minio_utils import get_minio_client
 from app.clients.mongo_dedup_utils import clear_by_file_title, get_records_by_titles
+from app.clients.neo4j_utils import count_graph_by_file_titles, delete_doc_graph
 from app.conf.minio_config import minio_config
 from app.conf.milvus_config import milvus_config
 from app.core.logger import logger
@@ -42,9 +44,9 @@ def list_imported_documents() -> List[Dict[str, Any]]:
     """
     列出所有已导入文档
 
-    以 Milvus kb_chunks 为主聚合：SQLite 只记录走过 Web 上传的文档，
-    命令行/早期导入的文档没有记录，只读 SQLite 会漏掉它们。
-    SQLite 记录用于补充 item_name 和 imported_at（有则更准确）。
+    以 Milvus kb_chunks 为主聚合：MongoDB 只记录走过 Web 上传的文档，
+    命令行/早期导入的文档没有记录，只读 MongoDB 会漏掉它们。
+    MongoDB 记录用于补充 item_name 和 imported_at（有则更准确）。
 
     :return: 文档信息列表，按切片数倒序
     """
@@ -81,7 +83,15 @@ def list_imported_documents() -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning(f"[{function_name}] 读取Mongo去重记录失败（不影响列表）：{e}")
 
-    # 4. 合并
+    # 4. Neo4j 图谱规模。Neo4j 不可用时返回空字典，列表照常展示——
+    #    否则图谱一挂，连文档列表都用不了
+    kg_info: Dict[str, Dict[str, int]] = {}
+    try:
+        kg_info = count_graph_by_file_titles(list(chunk_counts.keys()))
+    except Exception as e:
+        logger.warning(f"[{function_name}] 读取Neo4j图谱统计失败（不影响列表）：{e}")
+
+    # 5. 合并
     documents = []
     for file_title, chunk_count in chunk_counts.items():
         extra = mongo_info.get(file_title, {})
@@ -92,6 +102,8 @@ def list_imported_documents() -> List[Dict[str, Any]]:
             "chunk_count": chunk_count,
             "imported_at": extra.get("imported_at", ""),
             "status": extra.get("status", ""),
+            # 图谱实体数；Neo4j 不可用时为 0
+            "kg_entities": kg_info.get(file_title, {}).get("entities", 0),
         })
 
     documents.sort(key=lambda d: d["chunk_count"], reverse=True)
@@ -186,6 +198,17 @@ def _revoke_milvus(file_title: str) -> Dict[str, Any]:
             logger.error(f"删除 Milvus {collection} 失败：{e}", exc_info=True)
             result[label] = f"失败：{e}"
     return {"ok": True, "detail": result}
+
+
+def _revoke_neo4j(file_title: str) -> Dict[str, Any]:
+    """
+    删除文档在 Neo4j 知识图谱里的数据
+
+    安全性依据同 Milvus：实体与切片节点都带 file_title、不存在跨文档共享节点，
+    所以 DETACH DELETE 只会带走本文档的节点与它自己的边。
+    Neo4j 不可用时返回 ok=False，但不影响其余撤回步骤。
+    """
+    return delete_doc_graph(file_title)
 
 
 def _revoke_dedup_record(file_title: str) -> Dict[str, Any]:
@@ -297,6 +320,7 @@ def revoke_document(file_title: str) -> Dict[str, Any]:
         "file_title": file_title,
         "local_paths": local_paths,
         "milvus": _revoke_milvus(file_title),
+        "neo4j": _revoke_neo4j(file_title),
         "dedup": _revoke_dedup_record(file_title),
         "local": _revoke_local(local_paths),
         "minio": _revoke_minio(file_title),
@@ -305,7 +329,7 @@ def revoke_document(file_title: str) -> Dict[str, Any]:
     # 汇总：任何一处 ok=False 都算部分失败
     all_ok = all(
         report[k].get("ok", False)
-        for k in ("milvus", "dedup", "local", "minio")
+        for k in ("milvus", "neo4j", "dedup", "local", "minio")
     )
     report["success"] = all_ok
     if all_ok:

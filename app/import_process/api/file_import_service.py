@@ -288,6 +288,44 @@ async def list_imported_documents():
     return {"code": 200, "total": len(documents), "documents": documents}
 
 
+@app.get("/documents/graph", summary="查询单文档知识图谱")
+async def get_document_graph(file_title: str):
+    """
+    读取一份文档在 Neo4j 里的实体-关系图，供前端可视化
+
+    用查询参数而非路径参数：中文文档名会自动 percent-decode，
+    也不会与 DELETE /documents/{file_title} 的路由语义纠缠。
+
+    统一返回 HTTP 200 并带 available 字段——Neo4j 不可用或该文档没有图谱时
+    available=false，前端只需判这一个字段，不必处理非 2xx。
+    """
+    function_name = sys._getframe().f_code.co_name
+    from app.clients.neo4j_utils import read_doc_graph
+
+    logger.info(f"[{function_name}] 查询图谱：{file_title}")
+    result = read_doc_graph(file_title)
+
+    if not result["available"]:
+        return {
+            "code": 503,
+            "available": False,
+            "file_title": file_title,
+            "message": "Neo4j 不可用，或该文档还没有图谱数据",
+            "nodes": [],
+            "edges": [],
+            "stats": result["stats"],
+        }
+
+    return {
+        "code": 200,
+        "available": True,
+        "file_title": file_title,
+        "nodes": result["nodes"],
+        "edges": result["edges"],
+        "stats": result["stats"],
+    }
+
+
 @app.delete("/documents/{file_title}", summary="撤回已导入文档")
 async def revoke_document_api(file_title: str, confirm: bool = False):
     """
