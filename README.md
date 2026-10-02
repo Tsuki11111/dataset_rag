@@ -115,12 +115,78 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 未开始 ⬜
 
-暂无。导入链路与检索链路共 16 个节点均已实现并验证。
+功能节点暂无待办——导入链路与检索链路共 16 个节点均已实现并验证。
 
-**企业级改造**（可观测性、Durable Execution、多租户、治理）的完整路线见
-[HANDOFF.md](HANDOFF.md) 第 3.5 节 —— 那里有分阶段清单与优先级建议，本文不重复。
+**企业化改造**（可观测性、Durable Execution、多租户、治理）的路线与逐项进度见下面
+「企业化改造路线」一节。
 
 零散的后续方向：给图谱侧排序做更可靠的权重、把其余 4 份文档重新导入以生成图谱、答案配图做去重与缩略图。
+
+---
+
+## 企业化改造路线（待办与进度）
+
+参考 [《Zero2Agent · Agent Infra》](https://onefly.top/zero2Agent/learn-agent-basic/09-agent-infra/index.html)
+的六层标准。**现状**：Harness 层已相当完整（16 个节点、四路召回、图谱、MCP），
+但 Infra 层几乎是空的——对照文中递进（Demo → 内部工具 → **面向用户产品** → 企业平台 → 强合规），
+目前处在中间偏下。
+
+> **本节是路线的唯一权威**，HANDOFF 只留指针，避免两份文档各自演化。
+> 当前进度：**16 项完成 1 项**。
+
+文中两个判断值得记住：
+「**Checkpoint + Durable Execution 是从 Demo 到生产最关键一步**」，
+以及「多租户、成本归因、合规审计、Guardrails、灰度占据企业 Infra 70% 以上工作量」。
+
+### 现在就存在的三个问题
+
+这三条是后面所有工作的动机，也是判断优先级时的依据。
+
+| 问题 | 现状 |
+|---|---|
+| **异常被 `except` 吞掉** | 实现 `node_query_kg` 时一个 `NameError` 被「失败不中断链路」的兜底 `except` 降级成 warning，图谱那一路静默返回空、功能等于废了，只有测试断言才发现 |
+| **任务状态在内存里** | `task_utils` 用普通 dict 存运行/完成列表，**服务一重启，进行中的导入就凭空消失** |
+| **成本完全不可见** | 一次问答要调 LLM + 四路召回 + 重排 + 图谱 + MCP，花了多少、谁花的，账上一片空白 |
+
+### Phase 1 · 地基（最该先做）
+
+- [x] **访问鉴权与租户标识** —— ✅ 已完成，见[「访问鉴权」](#访问鉴权)一节：
+      API Key + HttpOnly Cookie，9 个数据接口全部受保护。
+      **但只做认证、不做数据隔离**：密钥带 `tenant_id`，数据尚未按它过滤
+- [ ] **单次调用记账** —— 挂 LangChain callback，记录 model / tokens / 延迟 / 成本。
+      **投入产出比最高的一项**：做完才知道钱花在哪，也才有数据判断后续该往哪投
+- [ ] **结构化日志** —— 把纯文本日志换成带 `trace_id` / `tenant_id` / `node` 的结构化输出
+- [ ] **异常分级处置** —— 按 timeout / 429 / 5xx / refusal / invalid tool args 分别处理，
+      替掉现在一律 `except: return []` 的写法
+
+### Phase 2 · 可靠性
+
+- [ ] **LangGraph checkpointer**（`SqliteSaver` / `PostgresSaver`）
+      —— 框架自带，接上即可从断点续跑；文中称这是「从 Demo 到生产最关键一步」
+- [ ] 故障分类重试：timeout 有限重试、429 退避、refusal 不盲重试、invalid tool args 绝不执行
+- [ ] 单节点超时 + 整个查询的 wall-clock / token 预算
+- [ ] `task_utils` 从内存搬到 Redis / Postgres
+
+### Phase 3 · 多租户与观测
+
+- [ ] 四个存储加 `tenant_id`：Milvus（**要重建集合**）、Neo4j、MongoDB、MinIO 路径前缀
+- [ ] per-tenant 并发槽位、token 预算、工具频率限制
+- [ ] 分布式 trace（OpenTelemetry / Langfuse）
+- [ ] 成本归因与分摊
+
+### Phase 4 · 治理
+
+- [ ] Guardrails：输入护栏、输出护栏、工具护栏
+- [ ] append-only 审计日志（`who` / `what` / `risk_score` / `approver`）
+- [ ] 高危操作人工审批 —— 「撤回文档」就是典型场景
+- [ ] Agent 版本管理（prompt hash + tool set hash + model version）与灰度发布
+
+### 优先级建议
+
+**别按顺序全做。** 文中那张递进表本质是在说：做到「面向用户产品」那一档就已经拿到 80% 的收益，
+多租户 + chargeback + 灰度那一档是给多团队平台准备的，单人 / 小团队做进去性价比很低。
+
+**Phase 1 的前两项无论如何先做**——它们不依赖任何架构决策，而且做完之后才有数据判断后续该往哪投。
 
 ---
 
