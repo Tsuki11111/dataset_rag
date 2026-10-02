@@ -2,6 +2,7 @@ from langgraph.constants import END
 from langgraph.graph import StateGraph
 
 from app.core.logger import logger
+from app.core.usage_tracker import add_tracked_node
 from app.query_process.agent.nodes.node_answer_output import node_answer_output
 from app.query_process.agent.nodes.node_item_name_confirm import node_item_name_confirm
 from app.query_process.agent.nodes.node_query_kg import node_query_kg
@@ -16,16 +17,18 @@ from app.query_process.agent.state import QueryGraphState
 builder = StateGraph(QueryGraphState)
 
 # 注册所有节点
-builder.add_node("node_item_name_confirm", node_item_name_confirm)   # 确认产品名
+# 用 add_tracked_node 而非 add_node：多包一层归因，让节点内所有模型调用都记到该节点名下
+# （账本里的 node 字段），节点内部代码一行都不用改
+add_tracked_node(builder, "node_item_name_confirm", node_item_name_confirm)   # 确认产品名
 builder.add_node("node_multi_search", lambda x: x)                   # 虚拟节点：多路搜索分叉点
-builder.add_node("node_search_embedding", node_search_embedding)     # 向量检索
-builder.add_node("node_search_embedding_hyde", node_search_embedding_hyde)  # HyDE 检索
-builder.add_node("node_query_kg", node_query_kg)                     # 图谱检索
-builder.add_node("node_web_search_mcp", node_web_search_mcp)         # 联网检索
+add_tracked_node(builder, "node_search_embedding", node_search_embedding)     # 向量检索
+add_tracked_node(builder, "node_search_embedding_hyde", node_search_embedding_hyde)  # HyDE 检索
+add_tracked_node(builder, "node_query_kg", node_query_kg)                     # 图谱检索
+add_tracked_node(builder, "node_web_search_mcp", node_web_search_mcp)         # 联网检索
 builder.add_node("node_join", lambda x: {})                          # 虚拟节点：多路搜索合并点
-builder.add_node("node_rrf", node_rrf)                               # RRF 融合排序
-builder.add_node("node_rerank", node_rerank)                         # 重排序
-builder.add_node("node_answer_output", node_answer_output)           # 生成答案
+add_tracked_node(builder, "node_rrf", node_rrf)                               # RRF 融合排序
+add_tracked_node(builder, "node_rerank", node_rerank)                         # 重排序
+add_tracked_node(builder, "node_answer_output", node_answer_output)           # 生成答案
 
 # 虚拟节点的作用：作为流程的「分叉 / 合并中转站」，解决多分支流程的组织问题，本身无业务逻辑
 

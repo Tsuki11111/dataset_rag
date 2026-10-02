@@ -26,6 +26,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.clients.mongo_history_utils import clear_history, get_recent_messages
 from app.core.logger import logger
+from app.core.usage_tracker import current_context, usage_context
 from app.query_process.agent.main_graph import query_app
 from app.utils.auth_utils import clear_session_cookie, current_tenant, set_session_cookie
 from app.utils.sse_utils import SSEEvent, create_sse_queue, push_to_session, sse_generator
@@ -67,41 +68,64 @@ class QueryRequest(BaseModel):
     is_stream: bool = Field(False, description="是否流式返回")
 
 
-def run_query_graph(session_id: str, user_query: str, is_stream: bool = True):
+def run_query_graph(session_id: str, user_query: str, is_stream: bool = True,
+                    tenant_id: str = None) -> dict:
     """
     后台执行检索图
 
     由 BackgroundTasks 触发，不阻塞 HTTP 响应。图内各节点会自行更新任务进度，
     而 task_utils 的进度更新会通过 push_to_session 推给 SSE 连接（仅流式模式）。
 
+    整个执行过程包在 `usage_context` 里：一次问答 = 一个 trace，图内所有模型调用
+    （含四路并发检索，各自在不同线程）都归到这条 trace 与调用方租户上。
+
     :param session_id: 会话ID，同时作为 SSE 队列的 key
     :param user_query: 用户原始问题
     :param is_stream: 是否流式推送
+    :param tenant_id: 调用方租户，来自访问密钥
+    :return: 本次问答的用量汇总（调用次数 / tokens / 估算成本）
     """
     function_name = sys._getframe().f_code.co_name
-    logger.info(f"[{NODE_NAME}] [{function_name}] 开始执行检索图，session={session_id}")
 
     init_state = {
         "original_query": user_query,
         "session_id": session_id,
         "is_stream": is_stream,
     }
-    try:
-        final_state = query_app.invoke(init_state)
+    # 流式模式下把用量实时推给前端（「本次消耗」那一行）：
+    # 每记完一笔调一次，前端边看答案边看钱。
+    # 非流式没有 SSE 队列，不注册回调，避免 push_to_session 刷「没有队列」的告警。
+    on_usage = None
+    if is_stream:
+        on_usage = lambda summary: push_to_session(session_id, SSEEvent.USAGE, summary)
 
-        # 把最终答案存入任务结果，供非流式模式取用
-        answer = (final_state or {}).get("answer", "")
-        set_task_result(session_id, "answer", answer)
-        # 配图同样要带出去，否则非流式模式拿不到
-        set_task_result(session_id, "images", (final_state or {}).get("images") or [])
-        # push_queue=is_stream：只有流式模式才推送进度，避免无连接时产生告警噪音
-        update_task_status(session_id, TASK_STATUS_COMPLETED, is_stream)
-        logger.info(f"[{NODE_NAME}] [{function_name}] 检索图执行完成，session={session_id}")
-    except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 检索图执行失败：{e}", exc_info=True)
-        update_task_status(session_id, TASK_STATUS_FAILED, is_stream)
-        if is_stream:
-            push_to_session(session_id, SSEEvent.ERROR, {"error": str(e)})
+    with usage_context(session_id=session_id, tenant_id=tenant_id, node="query_graph",
+                       on_usage=on_usage) as acc:
+        logger.info(
+            f"[{NODE_NAME}] [{function_name}] 开始执行检索图，"
+            f"session={session_id}，trace={current_context().get('trace_id')}"
+        )
+        try:
+            final_state = query_app.invoke(init_state)
+
+            # 把最终答案存入任务结果，供非流式模式取用
+            answer = (final_state or {}).get("answer", "")
+            set_task_result(session_id, "answer", answer)
+            # 配图同样要带出去，否则非流式模式拿不到
+            set_task_result(session_id, "images", (final_state or {}).get("images") or [])
+            # push_queue=is_stream：只有流式模式才推送进度，避免无连接时产生告警噪音
+            update_task_status(session_id, TASK_STATUS_COMPLETED, is_stream)
+            logger.info(f"[{NODE_NAME}] [{function_name}] 检索图执行完成，session={session_id}")
+        except Exception as e:
+            logger.error(f"[{NODE_NAME}] [{function_name}] 检索图执行失败：{e}", exc_info=True)
+            update_task_status(session_id, TASK_STATUS_FAILED, is_stream)
+            if is_stream:
+                push_to_session(session_id, SSEEvent.ERROR, {"error": str(e)})
+
+    # 记账汇总放在 with 之外：退出上下文只是清掉归因，累计器还能读
+    summary = acc.summary()
+    logger.info(f"[{NODE_NAME}] [{function_name}] 本次问答记账：{acc.text()}")
+    return summary
 
 
 class LoginRequest(BaseModel):
@@ -168,18 +192,23 @@ async def chat():
     return FileResponse(page_path, media_type="text/html")
 
 
-@app.post("/query", summary="提交查询", dependencies=[Depends(current_tenant)])
-async def query(background_tasks: BackgroundTasks, request: QueryRequest):
+@app.post("/query", summary="提交查询")
+async def query(background_tasks: BackgroundTasks, request: QueryRequest,
+                user: dict = Depends(current_tenant)):
     """
     接收用户提问并启动后台检索流程
 
     流式模式：建 SSE 队列 → 后台跑图 → 立即返回 session_id（前端随即订阅 /stream）
     非流式模式：同步跑完图后直接返回答案
+
+    鉴权用参数形式而非 `dependencies=[...]`：需要拿到 tenant_id 才能把这次问答的
+    成本记到调用方名下。
     """
     function_name = sys._getframe().f_code.co_name
     user_query = request.query
     session_id = request.session_id or str(uuid.uuid4())
     is_stream = request.is_stream
+    tenant_id = user.get("tenant_id")
 
     logger.info(f"[{NODE_NAME}] [{function_name}] 收到查询，session={session_id}，流式={is_stream}，问题={user_query}")
 
@@ -188,7 +217,7 @@ async def query(background_tasks: BackgroundTasks, request: QueryRequest):
         create_sse_queue(session_id)
         update_task_status(session_id, TASK_STATUS_PROCESSING, is_stream)
 
-        background_tasks.add_task(run_query_graph, session_id, user_query, is_stream)
+        background_tasks.add_task(run_query_graph, session_id, user_query, is_stream, tenant_id)
         return {
             "message": "结果正在处理中...",
             "session_id": session_id,
@@ -196,7 +225,7 @@ async def query(background_tasks: BackgroundTasks, request: QueryRequest):
 
     # 非流式：同步执行，直接返回答案
     update_task_status(session_id, TASK_STATUS_PROCESSING, is_stream)
-    run_query_graph(session_id, user_query, is_stream)
+    usage = run_query_graph(session_id, user_query, is_stream, tenant_id)
     answer = get_task_result(session_id, "answer", "")
     images = get_task_result(session_id, "images", [])
     done_list = get_done_task_list(session_id)
@@ -207,6 +236,8 @@ async def query(background_tasks: BackgroundTasks, request: QueryRequest):
         "answer": answer,
         "images": images,
         "done_list": done_list,
+        # 本次问答花了多少：调用次数 / tokens / 估算成本（明细见 llm_usage 集合）
+        "usage": usage,
     }
 
 

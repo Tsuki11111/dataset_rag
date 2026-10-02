@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from app.clients.minio_utils import get_minio_client
 from app.core.logger import logger
+from app.core.usage_tracker import usage_context
 from app.import_process.agent.main_graph import kb_import_app
 from app.import_process.agent.state import get_default_state
 from app.clients.mongo_dedup_utils import (
@@ -131,7 +132,8 @@ async def get_import_page():
     return FileResponse(path=html_abs_path, media_type="text/html")
 
 
-def run_graph_task(task_id: str, local_dir: str, local_file_path: str, file_hash: str):
+def run_graph_task(task_id: str, local_dir: str, local_file_path: str, file_hash: str,
+                   tenant_id: str = None):
     """
     LangGraph 全流程后台任务
 
@@ -139,47 +141,55 @@ def run_graph_task(task_id: str, local_dir: str, local_file_path: str, file_hash
     逐节点流式执行图，每完成一个节点就更新任务进度，供前端轮询。
     执行结束后把结果（产品名、切片数）回填到 SQLite 去重记录。
 
+    整个执行过程包在 `usage_context` 里：一次导入 = 一个 trace，导入期间的所有模型调用
+    （视觉模型读图、产品名识别、切片嵌入、图谱抽取）都归到这条 trace 与上传者租户上。
+
     :param task_id: 任务唯一ID
     :param local_dir: 该任务的本地工作目录
     :param local_file_path: 上传文件的本地绝对路径
     :param file_hash: 文件SHA-256，用于回填去重记录
+    :param tenant_id: 上传者租户，来自访问密钥
     """
     function_name = sys._getframe().f_code.co_name
     update_task_status(task_id, "processing")
     logger.info(f"[{task_id}] 开始执行LangGraph全流程，文件：{local_file_path}")
 
-    try:
-        # 构造图初始状态：只需 task_id / local_file_path / local_dir
-        init_state = get_default_state()
-        init_state["task_id"] = task_id
-        init_state["local_dir"] = local_dir
-        init_state["local_file_path"] = local_file_path
+    with usage_context(session_id=task_id, tenant_id=tenant_id, node="import_graph") as acc:
+        try:
+            # 构造图初始状态：只需 task_id / local_file_path / local_dir
+            init_state = get_default_state()
+            init_state["task_id"] = task_id
+            init_state["local_dir"] = local_dir
+            init_state["local_file_path"] = local_file_path
 
-        # 流式执行：每完成一个节点就记录，前端轮询可见进度
-        final_state: Dict[str, Any] = {}
-        for event in kb_import_app.stream(init_state):
-            for node_name, node_result in event.items():
-                logger.info(f"[{task_id}] 节点执行完成：{node_name}")
-                add_done_task(task_id, node_name)
-                if isinstance(node_result, dict):
-                    final_state.update(node_result)
+            # 流式执行：每完成一个节点就记录，前端轮询可见进度
+            final_state: Dict[str, Any] = {}
+            for event in kb_import_app.stream(init_state):
+                for node_name, node_result in event.items():
+                    logger.info(f"[{task_id}] 节点执行完成：{node_name}")
+                    add_done_task(task_id, node_name)
+                    if isinstance(node_result, dict):
+                        final_state.update(node_result)
 
-        # 回填导入结果到去重记录
-        chunks = final_state.get("chunks") or []
-        update_document_result(
-            file_hash=file_hash,
-            status=STATUS_COMPLETED,
-            item_name=final_state.get("item_name") or "",
-            chunk_count=len(chunks),
-        )
-        update_task_status(task_id, "completed")
-        logger.info(f"[{task_id}] 全流程执行完毕，入库切片数：{len(chunks)}")
+            # 回填导入结果到去重记录
+            chunks = final_state.get("chunks") or []
+            update_document_result(
+                file_hash=file_hash,
+                status=STATUS_COMPLETED,
+                item_name=final_state.get("item_name") or "",
+                chunk_count=len(chunks),
+            )
+            update_task_status(task_id, "completed")
+            logger.info(f"[{task_id}] 全流程执行完毕，入库切片数：{len(chunks)}")
 
-    except Exception as e:
-        # 标记 failed：让用户能重新上传同一文件（去重只拦截 processing/completed）
-        update_document_result(file_hash=file_hash, status=STATUS_FAILED)
-        update_task_status(task_id, "failed")
-        logger.error(f"[{task_id}] 全流程执行失败：{str(e)}", exc_info=True)
+        except Exception as e:
+            # 标记 failed：让用户能重新上传同一文件（去重只拦截 processing/completed）
+            update_document_result(file_hash=file_hash, status=STATUS_FAILED)
+            update_task_status(task_id, "failed")
+            logger.error(f"[{task_id}] 全流程执行失败：{str(e)}", exc_info=True)
+
+    # 导入的 token 花销远大于一次问答（整篇文档的嵌入 + 图谱抽取），值得单独报一行
+    logger.info(f"[{task_id}] 本次导入记账：{acc.text()}")
 
 
 def _save_upload_file(file: UploadFile, dest_path: str) -> None:
@@ -192,11 +202,12 @@ def _save_upload_file(file: UploadFile, dest_path: str) -> None:
         shutil.copyfileobj(file.file, buffer, length=1024 * 1024)
 
 
-@app.post("/upload", summary="文件上传接口", dependencies=[Depends(current_tenant)])
+@app.post("/upload", summary="文件上传接口")
 async def upload_files(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(..., description="待导入的文件（PDF/MD），支持多选"),
     force: bool = Form(False, description="true表示即使检测到重复也强制重新导入"),
+    user: dict = Depends(current_tenant),
 ):
     """
     文件上传接口（含重复文档检测）
@@ -291,7 +302,10 @@ async def upload_files(
         save_document_record(file_hash, file_title, status=STATUS_PROCESSING)
 
         # 8. 启动后台导入任务
-        background_tasks.add_task(run_graph_task, task_id, task_local_dir, local_file_abs_path, file_hash)
+        background_tasks.add_task(
+            run_graph_task, task_id, task_local_dir, local_file_abs_path, file_hash,
+            user.get("tenant_id"),
+        )
         task_ids.append(task_id)
         logger.info(f"[{task_id}] 已加入后台任务队列，文件名：{original_name}")
 

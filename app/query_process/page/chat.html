@@ -298,6 +298,54 @@
     color: var(--accent); background: var(--accent-soft);
   }
 
+  /* ============================================================
+     本次消耗
+     挂在答案卡片底部，随每个模型调用结束实时跳动（用法同桌面端的状态条）
+     ============================================================ */
+  .usage-bar {
+    display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+    padding: 10px 22px; border-top: 1px solid var(--line);
+    background: color-mix(in srgb, var(--surface-2) 55%, var(--surface));
+    font-size: 11.5px; color: var(--ink-dim);
+  }
+  .usage-bar[hidden] { display: none; }
+  .usage-bar .dot {
+    width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+    background: var(--live); animation: pulse 1.4s ease-in-out infinite;
+  }
+  .usage-bar.done .dot { background: var(--done); animation: none; }
+  .usage-bar .label { letter-spacing: .06em; }
+  .usage-bar .stat { font-family: var(--font-mono); color: var(--ink-2); white-space: nowrap; }
+  .usage-bar .stat b { font-weight: 600; color: var(--ink); }
+  .usage-bar .sep { color: var(--line-strong); }
+  /* 数值跳动时闪一下强调色，让「又花了一笔」看得见 */
+  @keyframes tick { from { color: var(--accent) } to { color: var(--ink) } }
+  .usage-bar .bump { animation: tick .85s ease-out; }
+  .usage-bar .expand {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 5px;
+    padding: 0; border: none; background: none; cursor: pointer;
+    font: inherit; color: var(--ink-dim); user-select: none;
+  }
+  .usage-bar .expand:hover { color: var(--ink-2); }
+  .usage-bar .expand svg { width: 9px; height: 9px; transition: transform .25s var(--ease); }
+  .usage-bar.open .expand svg { transform: rotate(90deg); }
+  .usage-detail { display: none; width: 100%; margin-top: 8px; }
+  .usage-bar.open .usage-detail { display: block; }
+  .usage-row {
+    display: grid; grid-template-columns: 1fr auto auto auto;
+    gap: 14px; align-items: baseline;
+    padding: 4px 0; font-family: var(--font-mono); font-size: 11px;
+    color: var(--ink-2); border-top: 1px dashed var(--line);
+  }
+  .usage-row:first-child { border-top: none; }
+  .usage-row.head { color: var(--ink-dim); font-size: 10px; letter-spacing: .08em; }
+  .usage-row .who { font-family: var(--font-sans); color: var(--ink-2); }
+  .usage-row.head .who { color: var(--ink-dim); }
+  .usage-row .num { text-align: right; }
+  .usage-row .cost { color: var(--ink); }
+  .usage-bar .fail { color: var(--fail); }
+  .usage-bar .note { color: var(--ink-dim); }
+
   /* 访问密钥登录层：任何接口返回 401 时弹出 */
   .login-mask {
     position: fixed; inset: 0; z-index: 60; display: flex;
@@ -828,6 +876,21 @@ function addAnswer() {
       </div>
       <div class="answer-body"><div class="txt" id="txt"></div></div>
       <div class="answer-figs" id="figs"></div>
+      <div class="usage-bar" id="usage" hidden>
+        <span class="dot"></span>
+        <span class="label">本次消耗</span>
+        <span class="stat" id="usageTokens"></span>
+        <span class="sep">·</span>
+        <span class="stat" id="usageCost"></span>
+        <span class="sep">·</span>
+        <span class="stat" id="usageCalls"></span>
+        <span class="stat" id="usageTime"></span>
+        <button class="expand" id="usageToggle" type="button" aria-expanded="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+          明细
+        </button>
+        <div class="usage-detail" id="usageDetail"></div>
+      </div>
     </div>`;
 
   column.appendChild(el);
@@ -844,6 +907,14 @@ function addAnswer() {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
   };
 
+  // 「本次消耗」的展开/收起
+  const usageBar = el.querySelector('#usage');
+  const usageToggle = el.querySelector('#usageToggle');
+  usageToggle.onclick = () => {
+    const open = usageBar.classList.toggle('open');
+    usageToggle.setAttribute('aria-expanded', String(open));
+  };
+
   return {
     el,
     pipe,
@@ -852,6 +923,15 @@ function addAnswer() {
     count: el.querySelector('#pipeCount'),
     txt: el.querySelector('#txt'),
     figs: el.querySelector('#figs'),
+    usage: {
+      bar: usageBar,
+      tokens: el.querySelector('#usageTokens'),
+      cost: el.querySelector('#usageCost'),
+      calls: el.querySelector('#usageCalls'),
+      time: el.querySelector('#usageTime'),
+      detail: el.querySelector('#usageDetail'),
+      last: null,          // 最近一次收到的用量，final 时用它定格
+    },
     buf: '',            // 流式累积的答案原文，每次重渲染整段
   };
 }
@@ -870,6 +950,63 @@ function renderImages(ctx, images) {
         <figcaption><span class="fig-no">图 ${i + 1}</span>${esc(it.caption || '未标注来源')}</figcaption>
       </figure>`).join('') +
     '</div>';
+}
+
+/* ============================================================
+   本次消耗：随每次模型调用结束实时跳动
+   ============================================================ */
+function fmtTokens(n) {
+  n = n || 0;
+  if (n < 1000) return String(n);
+  if (n < 10000) return (n / 1000).toFixed(2).replace(/\.?0+$/, '') + 'k';
+  return (n / 1000).toFixed(1) + 'k';
+}
+/* 单次问答的成本在分以下，用四位小数会全被抹成 0，所以小值多给两位 */
+function fmtCost(v) {
+  v = v || 0;
+  if (!v) return '0';
+  return v < 0.001 ? v.toFixed(6) : v.toFixed(4);
+}
+/* 数值变化时闪一下强调色：不然数字悄悄改了，看不出「又花了一笔」 */
+function setStat(el, html) {
+  if (el.innerHTML === html) return;
+  el.innerHTML = html;
+  const b = el.querySelector('b');
+  if (b) {
+    b.classList.remove('bump');
+    void b.offsetWidth;          // 强制回流，否则连续两次加同一个 class 不重播动画
+    b.classList.add('bump');
+  }
+}
+
+function renderUsage(ctx, usage, running) {
+  if (!usage) return;
+  const u = ctx.usage;
+  u.last = usage;
+  u.bar.hidden = false;
+  u.bar.classList.toggle('done', running === false);
+
+  setStat(u.tokens, `↑ <b>${fmtTokens(usage.prompt_tokens)}</b> ↓ <b>${fmtTokens(usage.completion_tokens)}</b>`);
+  setStat(u.cost, `¥<b>${fmtCost(usage.cost)}</b>`);
+  setStat(u.calls, `<b>${usage.calls}</b> 次调用`
+    + (usage.failed ? ` <span class="fail">${usage.failed} 失败</span>` : '')
+    + (usage.unpriced_calls ? ` <span class="note">${usage.unpriced_calls} 次未计价</span>` : ''));
+  // 耗时只在结束后显示：进行中它只随调用结束跳一下，读着像卡住了
+  u.time.innerHTML = running === false
+    ? `<span class="sep">·</span> ${(usage.elapsed_ms / 1000).toFixed(1)}s`
+    : '';
+
+  const rows = (usage.by_node || []).map(it => `
+    <div class="usage-row">
+      <span class="who">${esc((it.node || '—').replace(/^node_/, ''))}</span>
+      <span class="num">${it.calls} 次</span>
+      <span class="num">${fmtTokens(it.tokens)}</span>
+      <span class="num cost">¥${fmtCost(it.cost)}</span>
+    </div>`).join('');
+  u.detail.innerHTML = rows
+    ? `<div class="usage-row head"><span class="who">按节点</span><span class="num">调用</span>`
+      + `<span class="num">tokens</span><span class="num cost">成本</span></div>${rows}`
+    : '';
 }
 
 /* ============================================================
@@ -956,6 +1093,11 @@ async function streamFlow(query, ctx) {
     scrollDown();
   });
 
+  // 每有一次模型调用结束就推一次：边看答案边看钱
+  eventSource.addEventListener('usage', (e) => {
+    try { renderUsage(ctx, JSON.parse(e.data), true); } catch (_) {}
+  });
+
   eventSource.addEventListener('final', (e) => {
     const d = JSON.parse(e.data);
     ctx.buf = d.answer || '';
@@ -968,6 +1110,8 @@ async function streamFlow(query, ctx) {
     ctx.count.textContent = n;
     ctx.pipe.classList.remove('open');     // 收起过程，让答案占主视野
     ctx.head.setAttribute('aria-expanded', 'false');
+    // 用最后一次用量定格（换成已完成态：圆点停跳、补上总耗时）
+    renderUsage(ctx, ctx.usage.last, false);
     setConn('已完成', 'on');
     $('hint').textContent = '就绪';
     finish();
@@ -979,6 +1123,7 @@ async function streamFlow(query, ctx) {
     ctx.title.textContent = '检索出错';
     ctx.title.style.color = 'var(--fail)';
     ctx.txt.textContent = msg;
+    renderUsage(ctx, ctx.usage.last, false);   // 出错也要让消耗条停下，别一直转
     setConn('异常', 'err');
     finish();
   });
@@ -1021,6 +1166,7 @@ async function syncFlow(query, ctx) {
     if (d.session_id) sessionId = d.session_id;
     paintAnswer(ctx, d.answer || '（未返回答案）', false);
     renderImages(ctx, d.images);
+    renderUsage(ctx, d.usage, false);
     if (d.done_list && d.done_list.length) {
       const n = renderPipeline(ctx, d.done_list, []);
       ctx.title.textContent = '检索完成';

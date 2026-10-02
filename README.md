@@ -39,10 +39,11 @@ app/
 │   ├── minio_utils.py       # MinIO 客户端
 │   ├── mongo_history_utils.py   # 会话历史读写
 │   ├── mongo_dedup_utils.py     # 上传去重指纹
+│   ├── mongo_usage_utils.py     # 调用账本（每次模型调用的 tokens/延迟/成本）+ 报表
 │   ├── mcp_search_utils.py  # 百炼 MCP 联网搜索（Streamable HTTP）
 │   └── neo4j_utils.py       # Neo4j 知识图谱读写、幂等清理、图谱统计
-├── conf/                    # 各服务的配置类（读 .env）
-├── core/                    # 日志、提示词加载
+├── conf/                    # 各服务的配置类（读 .env），含 pricing_config.py（模型计价表）
+├── core/                    # 日志、提示词加载、usage_tracker（单次调用记账）
 ├── lm/                      # LLM 客户端、嵌入、重排
 ├── import_process/          # ── 导入链路 ──
 │   ├── agent/main_graph.py      # 导入图编排 + 端到端测试
@@ -108,8 +109,9 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 **查询服务**（`query_service.py`，端口 **8002**）已完成：
 
 - `POST /login` / `POST /logout` —— 用访问密钥换 / 清 HttpOnly 会话 Cookie
-- `POST /query` —— 提交问题（流式返回 session_id / 非流式直接返回 `answer` + `images`）
-- `GET /stream/{session_id}` —— **SSE** 推送 `ready` / `progress` / `delta` / `final` / `error`（`final` 带 `answer` 与 `images`）
+- `POST /query` —— 提交问题（流式返回 session_id / 非流式直接返回 `answer` + `images` + `usage`）
+- `GET /stream/{session_id}` —— **SSE** 推送 `ready` / `progress` / `delta` / **`usage`** / `final` / `error`
+  （`final` 带 `answer` 与 `images`；`usage` 每记完一笔就推一次累计用量，见[「调用记账」](#调用记账)）
 - `GET /history/{session_id}`、`DELETE /history/{session_id}` —— 会话历史查询与清空
 - 前端 [chat.html](app/query_process/page/chat.html)：检索管线可视化、流式答案（**Markdown 渲染**）、**答案配图**、昼夜模式
 
@@ -132,7 +134,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 目前处在中间偏下。
 
 > **本节是路线的唯一权威**，HANDOFF 只留指针，避免两份文档各自演化。
-> 当前进度：**16 项完成 1 项**。
+> 当前进度：**16 项完成 2 项**。
 
 文中两个判断值得记住：
 「**Checkpoint + Durable Execution 是从 Demo 到生产最关键一步**」，
@@ -146,15 +148,17 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 |---|---|
 | **异常被 `except` 吞掉** | 实现 `node_query_kg` 时一个 `NameError` 被「失败不中断链路」的兜底 `except` 降级成 warning，图谱那一路静默返回空、功能等于废了，只有测试断言才发现 |
 | **任务状态在内存里** | `task_utils` 用普通 dict 存运行/完成列表，**服务一重启，进行中的导入就凭空消失** |
-| **成本完全不可见** | 一次问答要调 LLM + 四路召回 + 重排 + 图谱 + MCP，花了多少、谁花的，账上一片空白 |
+| ~~**成本完全不可见**~~ | **✅ 已解决**，见[「调用记账」](#调用记账)：一次问答要调 LLM + 四路召回 + 重排 + 图谱 + MCP，此前花了多少、谁花的账上一片空白；现在每次调用逐笔入账，可按类型 / 模型 / 租户 / 单次请求归集 |
 
 ### Phase 1 · 地基（最该先做）
 
 - [x] **访问鉴权与租户标识** —— ✅ 已完成，见[「访问鉴权」](#访问鉴权)一节：
       API Key + HttpOnly Cookie，9 个数据接口全部受保护。
       **但只做认证、不做数据隔离**：密钥带 `tenant_id`，数据尚未按它过滤
-- [ ] **单次调用记账** —— 挂 LangChain callback，记录 model / tokens / 延迟 / 成本。
-      **投入产出比最高的一项**：做完才知道钱花在哪，也才有数据判断后续该往哪投
+- [x] **单次调用记账** —— ✅ 已完成，见[「调用记账」](#调用记账)一节：
+      LangChain callback 采集 LLM 用量 + 三处手工埋点（嵌入 / 重排 / 联网搜索），
+      逐笔写 MongoDB `llm_usage`，可按类型 / 模型 / 租户 / 单次请求出报表。
+      `tenant_id` 已经进账本，为 Phase 3 的成本归因留好了接口
 - [ ] **结构化日志** —— 把纯文本日志换成带 `trace_id` / `tenant_id` / `node` 的结构化输出
 - [ ] **异常分级处置** —— 按 timeout / 429 / 5xx / refusal / invalid tool args 分别处理，
       替掉现在一律 `except: return []` 的写法
@@ -319,6 +323,89 @@ docker compose -f docker/neo4j-compose.yml up -d
 
 ---
 
+## 调用记账
+
+每一次外部模型调用（LLM 生成 / 嵌入 / 重排 / 联网搜索）都记一笔账，回答「钱花在哪」。
+
+```bash
+# 看最近 1 天 / 7 天的账（按类型、模型、租户、最贵的几次请求）
+.venv/Scripts/python.exe -m app.clients.mongo_usage_utils
+.venv/Scripts/python.exe -m app.clients.mongo_usage_utils 7
+```
+
+```python
+# 某一次问答的明细（排查「这次怎么这么贵」）
+from app.clients.mongo_usage_utils import summarize_trace
+summarize_trace("<trace_id>")
+```
+
+**页面上也看得到**：每张答案卡片底部有一行「本次消耗」——`↑9.1k ↓1.03k · ¥0.0093 · 8 次调用 · 20.4s`。
+流式回答时它**随每次模型调用结束实时跳动**（正在跑时圆点是活的，跑完停跳并补上总耗时），
+点「明细」展开还能看到按节点拆分的调用次数 / tokens / 成本——
+`rerank` 这类不显眼的环节花掉多少，一眼就能看见。
+
+实现上记账层不碰 SSE：`usage_context(on_usage=...)` 收一个进度回调，
+查询服务把「推 `usage` 事件给前端」这件事作为回调传进去，依赖方向保持单向。
+非流式路径则直接用 `/query` 响应里的 `usage` 字段。
+
+**首次实测**（一次完整问答，「Brother HAK 180 烫金机怎么安装烫金膜盒？」，
+8 次调用、约 1 万 tokens、估算 **0.0095 元**，其中）：
+
+| 环节 | 成本占比 | 说明 |
+|---|---|---|
+| 生成答案 | 47% | 上下文最大（7 条切片 ≈ 4.7k 字符），且是流式长输出 |
+| 重排 | 43% | 15 条候选一起打分，输入 tokens 达 5k |
+| HyDE（LLM 生成假设文档 + 嵌入） | 7% | |
+| 产品名确认 / 向量检索 | 1.4% | |
+| 联网搜索 | 0% | 按次计费、单价未公开，只记次数不计成本 |
+
+单次样本不代表长期分布，但已经能回答一个具体问题：**这条链路里最贵的不是 LLM 生成，
+而是「把 15 条候选全喂给重排」**——想降本应从这里下手（比如先粗筛再精排），
+而不是去换更便宜的生成模型。
+
+**记账的边界**：MinerU 解析按页数配额计费、与 token 无关，不在账本内。
+
+### 三个设计取舍
+
+**LangChain callback 挂在 LLM 客户端上，而不是各调用点传 handler**
+16 个节点里有 8 处模型调用点，逐个传 handler 既侵入又必漏——**漏了还不报错**，
+只是账本上少一笔。挂在 `get_llm_client()` 返回的客户端上（它是全局缓存的单例），
+一次配置全项目生效，新增节点也自动被覆盖。
+
+**归因走 ContextVar，而不是函数参数**
+账本要回答「谁花的」，就得知道这次调用属于哪个租户、哪次会话、哪个节点。这些信息
+在服务入口和节点里天然存在，但传到底层 `generate_embeddings()` 要多穿 5 层。
+改用 ContextVar 存「当前请求」，入口设一次即可——**关键在于 LangGraph 的并发执行器
+提交节点任务前会 `copy_context()`**，所以四路并发检索（各自跑在不同线程）都能读到
+同一份归因，实测 8 次调用全部正确落到 `node_rerank` / `node_answer_output` 等节点名下。
+
+节点头上的归因不是每个节点自己写的，而是 `main_graph` 注册时用 `add_tracked_node`
+包一层——一张图只有一处需要维护，节点内部一行都不用改。
+
+**账本只把 tokens 当事实，成本是算出来的**
+单价会变（qwen-plus 就调过价）。记录里带当时的估算值，但**报表一律按当前计价表重算**，
+这样单价更新后历史账目跟着走，而不是冻结在当初的估算上。
+计价表在 `app/conf/pricing_config.py`，来源与查询日期逐条写在注释里。
+
+三处刻意的简化都在明面上：qwen-plus 的阶梯计价只取最低档（本项目上下文远小于 128k）；
+联网搜索按次计费、单价未公开，只记次数并把成本记为「未计价」而不是 0；
+**失败的调用也入账**（`ok=false` + 错误摘要），因为「哪条路经常挂」只有失败记录能回答。
+
+### 两个实现上的坑
+
+**流式必须显式开 `stream_usage`**
+`answer_output` 用 `llm.stream()` 生成答案，这是单次最贵的调用。而 langchain-openai
+只在 base_url 是 OpenAI 官方地址时才默认开启 `stream_usage`——本项目指向 DashScope，
+不显式传 `stream_usage=True` 就拿不到用量，**最贵的那笔账会静默漏记**。
+已在 `lm_utils.get_llm_client()` 里显式打开，并实测 DashScope 兼容端点会在最后一个
+chunk 返回 usage。
+
+**记账绝不能反过来弄坏主流程**
+所有落库与用量解析都吞异常并降级为 warning：一次账单写不进去，不该让用户拿不到答案。
+回调里抛异常还会污染 LangChain 的调用链，`TokenUsageCallback` 的两个回调体都整体兜了。
+
+---
+
 ## 端口一览
 
 | 端口 | 服务 |
@@ -361,6 +448,8 @@ docker compose -f docker/neo4j-compose.yml up -d
 |---|---|
 | `chat_message` | 会话历史（`session_id` + `ts` 复合索引） |
 | `imported_documents` | 上传去重指纹（`file_hash` 唯一索引） |
+| `llm_usage` | 调用账本，每次模型调用一条（append-only，`ts` / `trace_id` / `tenant_id` 索引），见[「调用记账」](#调用记账) |
+| `users` | 访问密钥（只存 sha256）与租户标识，见[「访问鉴权」](#访问鉴权) |
 
 **Neo4j**（知识图谱，按 `file_title` 隔离）
 
@@ -457,6 +546,12 @@ docker compose -f docker/neo4j-compose.yml up -d
 
 流式模式下**图片区块不推给前端**：一旦读到 `【图片】` 标记就停止推送 delta（但仍继续累积原文，否则解析不出链接），所以打字机效果不会闪过一段裸 URL。
 
+**标记可能被切在两个 chunk 之间**（先到「【」、下一块才是「图片】」），所以推之前会先扣住
+`len("【图片】")-1` 个字符不推——它们随时可能是标记的前缀。这条曾经漏掉：那个孤零零的
+「【」会跟着打字机闪过去，直到 final 覆盖才消失。修完后不变量是
+**「推出去的正文 == 最终答案里图片区块之前的部分」**，四个边界场景（切块 / 无标记 / 整块 /
+流停在半个标记上）都在 `node_answer_output._check_stream_boundary()` 里离线跑，不调接口。
+
 **一片都没检索到时直接兜底，不调 LLM**
 `reranked_docs` 为空时返回固定的「没有找到相关内容」而不是让模型自由发挥——没有参考内容时它只会编。
 
@@ -495,3 +590,6 @@ Milvus 每次重新入库都会生成**全新的 chunk_id**，重复导入时旧
 | 相似度阈值 | `kb_item_names` 的 0.85/0.6 阈值取自教程代码（教程正文写的是 0.95，两处不一致） |
 | 无引用的模块 | `format_utils.py`、`mongo_history_utils_new.py` 均无引用 |
 | 重排相对阈值验证样本少 | `GAP_RATIO=0.25` 由教程继承（相对值可跨尺度迁移），但只在少数真实查询上验证过，候选规模变化后可能仍需微调 |
+| 计价表是快照 | `pricing_config.py` 里的单价取自百炼 2026-10 的价目表；阶梯计价只按最低档算。tokens 是原始事实，单价更新后报表会自动按新价重算，但**表本身要人工跟** |
+| 账本有两处不计成本 | 联网搜索按次计费、单价未公开（账本记次数、成本标为「未计价」）；MinerU 按页数配额计费、与 token 无关，不在账本内 |
+| 导入链路的记账未做端到端验证 | 归因机制与检索链路完全相同（已实测 8 次调用全部正确归到节点），但没跑整篇文档导入去验证——那要真调 MinerU、耗时数分钟、消耗解析配额 |

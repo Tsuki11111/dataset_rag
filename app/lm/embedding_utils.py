@@ -1,5 +1,6 @@
 from openai import OpenAI
 from app.core.logger import logger
+from app.core.usage_tracker import Timer, record
 from app.conf.embedding_config import embedding_config
 
 # 文本上限参考：https://help.aliyun.com/zh/model-studio/text-embedding-api-reference
@@ -51,18 +52,23 @@ def _truncate(text):
 
 def _batch_encode(client, texts):
     """
-    分批调用DashScope embedding接口，返回嵌套列表，与输入文本一一对应
+    分批调用DashScope embedding接口，返回(嵌套列表, 总token数)，与输入文本一一对应
     """
     embeddings = []
+    total_tokens = 0
     batch_size = embedding_config.batch_size
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
         logger.debug(f"正在编码第{i // batch_size + 1}批，共{len(batch)}条")
         response = client.embeddings.create(model=embedding_config.model, input=batch)
+        # 接口返回的用量用于记账：嵌入按输入 token 计费，没有输出侧
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            total_tokens += getattr(usage, "prompt_tokens", 0) or getattr(usage, "total_tokens", 0) or 0
         # 按索引排序，保证顺序与输入一致（API可能乱序返回）
         sorted_emb = sorted(response.data, key=lambda d: d.index)
         embeddings.extend([item.embedding for item in sorted_emb])
-    return embeddings
+    return embeddings, total_tokens
 
 
 def generate_embeddings(texts):
@@ -77,18 +83,26 @@ def generate_embeddings(texts):
         raise ValueError("参数texts必须是包含文本的非空列表")
 
     logger.info(f"开始为{len(texts)}条文本生成稠密向量嵌入")
+    timer = Timer()
     try:
-        client = get_client()
-        texts = [_truncate(t) for t in texts]
-        dense = _batch_encode(client, texts)
-
-        result = {"dense": dense}  # 嵌套列表，与输入文本一一对应
-        logger.success(f"{len(texts)}条文本向量生成完成，维度={embedding_config.dimension}")
-        return result
-
+        with timer:
+            client = get_client()
+            texts = [_truncate(t) for t in texts]
+            dense, total_tokens = _batch_encode(client, texts)
     except Exception:
         logger.error("文本向量生成失败", exc_info=True)
+        # timer 的 __exit__ 已在异常穿出 with 时执行，此处读到的耗时是有效的
+        record("embedding", model=embedding_config.model, latency_ms=timer.ms, ok=False,
+               error="向量生成失败（详见日志）")
         raise  # 不吞异常，向上传递让调用方做重试/降级处理
+
+    # 非 LangChain 调用，手工埋点：嵌入按输入 token 计费，记一次调用（分批合并成一条账）
+    record("embedding", model=embedding_config.model, prompt_tokens=total_tokens,
+           latency_ms=timer.ms, items=len(texts))
+
+    result = {"dense": dense}  # 嵌套列表，与输入文本一一对应
+    logger.success(f"{len(texts)}条文本向量生成完成，维度={embedding_config.dimension}")
+    return result
 
 
 """

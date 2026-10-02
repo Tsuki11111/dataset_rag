@@ -8,6 +8,7 @@ from typing import Optional
 # 项目内部依赖
 from app.conf.lm_config import lm_config
 from app.core.logger import logger
+from app.core.usage_tracker import TokenUsageCallback
 
 # 全局缓存：键为(模型名, JSON输出模式)元组，值为ChatOpenAI实例
 # 作用：避免重复初始化客户端，提升性能，统一实例管理
@@ -62,6 +63,12 @@ def get_llm_client(model: Optional[str] = None, json_mode: bool = False) -> Chat
             base_url=lm_config.base_url,  # API基础地址（适配国产模型代理地址）
             extra_body=extra_body,  # 国产模型私有参数透传
             model_kwargs=model_kwargs,  # OpenAI通用参数
+            # 每次调用都记一笔账（模型/tokens/延迟/成本），见 app/core/usage_tracker.py。
+            # 挂在客户端上而不是各调用点：16 个节点里 8 处调用，逐个传 handler 必漏
+            callbacks=[TokenUsageCallback()],
+            # 流式也要用量。langchain-openai 只在 base_url 是 OpenAI 官方地址时才默认开启，
+            # 本项目指向 DashScope，不显式打开的话最贵的那次调用（流式生成答案）会漏记
+            stream_usage=True,
         )
     except LangChainException as e:
         raise Exception(f"[LLM客户端] 模型【{target_model}】初始化失败（LangChain层）：{str(e)}") from e

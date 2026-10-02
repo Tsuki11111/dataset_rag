@@ -3,6 +3,7 @@ from langgraph.constants import END
 from langgraph.graph import StateGraph
 
 from app.core.logger import logger
+from app.core.usage_tracker import add_tracked_node
 from app.import_process.agent.nodes.node_item_name_recognition import node_item_name_recognition
 from app.import_process.agent.nodes.node_dashscope_embedding import node_dashscope_embedding
 from app.import_process.agent.nodes.node_document_split import node_document_split
@@ -18,15 +19,16 @@ load_dotenv()
 # 初始化langgraph状态图
 workflow = StateGraph(ImportGraphState)
 # 注册所有子节点
-workflow.add_node("node_entry",node_entry)
-workflow.add_node("node_pdf_to_md",node_pdf_to_md)
-workflow.add_node("node_md_img",node_md_img)
-workflow.add_node("node_document_split",node_document_split)
-workflow.add_node("node_item_name_recognition",node_item_name_recognition)
-workflow.add_node("node_dashscope_embedding",node_dashscope_embedding)
-workflow.add_node("node_import_milvus",node_import_milvus)
+# 用 add_tracked_node 包一层归因：节点内的模型调用记到该节点名下，见 app/core/usage_tracker.py
+add_tracked_node(workflow, "node_entry", node_entry)
+add_tracked_node(workflow, "node_pdf_to_md", node_pdf_to_md)
+add_tracked_node(workflow, "node_md_img", node_md_img)
+add_tracked_node(workflow, "node_document_split", node_document_split)
+add_tracked_node(workflow, "node_item_name_recognition", node_item_name_recognition)
+add_tracked_node(workflow, "node_dashscope_embedding", node_dashscope_embedding)
+add_tracked_node(workflow, "node_import_milvus", node_import_milvus)
 # 图谱构建依赖 Milvus 回填的 chunk_id，所以必须排在 node_import_milvus 之后
-workflow.add_node("node_import_kg",node_import_kg)
+add_tracked_node(workflow, "node_import_kg", node_import_kg)
 
 # 设置入口节点
 workflow.set_entry_point("node_entry")

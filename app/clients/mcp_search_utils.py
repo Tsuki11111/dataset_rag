@@ -21,6 +21,7 @@ from agents.mcp import MCPServerStreamableHttp
 
 from app.conf.bailian_mcp_config import mcp_config
 from app.core.logger import logger
+from app.core.usage_tracker import Timer, record
 
 # 百炼增强搜索的工具名
 TOOL_NAME = "search_pro"
@@ -138,7 +139,18 @@ def search_web(query: str) -> list[dict]:
     if not mcp_config.api_key:
         raise McpSearchError("OPENAI_API_KEY 未配置")
 
-    return _parse_docs(_run_coro(mcp_call(query)))
+    timer = Timer()
+    try:
+        with timer:
+            docs = _parse_docs(_run_coro(mcp_call(query)))
+    except Exception as e:
+        record("mcp_search", model=TOOL_NAME, latency_ms=timer.ms, ok=False, error=str(e))
+        raise
+
+    # 非 LangChain 调用，手工埋点。百炼增强搜索按次计费、单价未公开，
+    # 故不传 tokens —— 记账里成本记为 None 并单独计数，而不是假装它免费
+    record("mcp_search", model=TOOL_NAME, latency_ms=timer.ms, results=len(docs))
+    return docs
 
 
 if __name__ == '__main__':

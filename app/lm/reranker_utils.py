@@ -13,6 +13,7 @@ import httpx
 
 from app.conf.reranker_config import reranker_config
 from app.core.logger import logger
+from app.core.usage_tracker import Timer, record
 
 TIMEOUT = 60.0
 
@@ -46,25 +47,34 @@ def rerank(query: str, documents: list, top_n: int = None) -> list:
         },
     }
 
+    timer = Timer()
     try:
-        resp = httpx.post(
-            reranker_config.base_url,
-            headers={
-                "Authorization": "Bearer " + reranker_config.api_key,
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=TIMEOUT,
-        )
+        with timer:
+            resp = httpx.post(
+                reranker_config.base_url,
+                headers={
+                    "Authorization": "Bearer " + reranker_config.api_key,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=TIMEOUT,
+            )
     except Exception as e:
+        # 记账后再抛：失败的调用同样入账，用于观察错误率
+        record("rerank", model=reranker_config.model, latency_ms=timer.ms, ok=False,
+               error=f"请求失败：{e}", docs=len(documents))
         raise RerankError(f"重排请求失败：{e}") from e
 
     if resp.status_code != 200:
+        record("rerank", model=reranker_config.model, latency_ms=timer.ms, ok=False,
+               error=f"HTTP {resp.status_code}", docs=len(documents))
         raise RerankError(f"重排接口返回 HTTP {resp.status_code}：{resp.text[:200]}")
 
     body = resp.json()
     results = (body.get("output") or {}).get("results")
     if results is None:
+        record("rerank", model=reranker_config.model, latency_ms=timer.ms, ok=False,
+               error="返回结构异常", docs=len(documents))
         raise RerankError(f"重排返回结构异常：{str(body)[:200]}")
 
     # 接口按 index 指回入参下标，这里一并带出，供调用方还原文档
@@ -75,6 +85,9 @@ def rerank(query: str, documents: list, top_n: int = None) -> list:
     scored.sort(key=lambda x: x["score"], reverse=True)
 
     usage = body.get("usage") or {}
+    total_tokens = usage.get("total_tokens") or 0
+    record("rerank", model=reranker_config.model, prompt_tokens=total_tokens,
+           latency_ms=timer.ms, docs=len(documents))
     logger.info(
         f"[重排] {len(scored)} 条打分完成，"
         f"分数区间 {scored[0]['score']:.4f}~{scored[-1]['score']:.4f}，"
