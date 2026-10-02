@@ -17,9 +17,10 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from app.clients.minio_utils import get_minio_client
 from app.core.logger import logger
@@ -33,6 +34,7 @@ from app.clients.mongo_dedup_utils import (
     save_document_record,
     update_document_result,
 )
+from app.utils.auth_utils import clear_session_cookie, current_tenant, set_session_cookie
 from app.utils.file_hash_utils import calc_file_hash
 from app.utils.path_util import PROJECT_ROOT
 from app.utils.task_utils import (
@@ -58,7 +60,6 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -75,12 +76,54 @@ async def on_startup():
     from app.clients.mongo_dedup_utils import get_dedup_tool
     get_dedup_tool()
     logger.info("去重工具已就绪（MongoDB）")
+
+    # 一个用户都没有时，所有数据接口都会 401，这里提前把话说明白，省得一头雾水
+    from app.clients.mongo_user_utils import count_users
+    if count_users() == 0:
+        logger.warning(
+            "还没有任何用户，数据接口将全部返回 401。"
+            "先建一个：.venv/Scripts/python.exe -m app.clients.mongo_user_utils add <称呼>"
+        )
+
     logger.info("File Import Service 启动完成")
+
+
+class LoginRequest(BaseModel):
+    """登录请求：提交访问密钥"""
+    key: str
+
+
+@app.post("/login", summary="登录：校验访问密钥并写入会话 Cookie")
+async def login(payload: LoginRequest, response: Response):
+    """
+    用访问密钥换一个 HttpOnly Cookie
+
+    走 Cookie 而不是让前端存密钥发请求头，是因为查询服务的流式接口用 `EventSource`，
+    它**无法自定义请求头**，只有 Cookie 能被浏览器自动携带；同理页面上十几处 fetch 也一行不用改。
+    """
+    function_name = sys._getframe().f_code.co_name
+    from app.clients.mongo_user_utils import verify_key
+
+    user = verify_key(payload.key)
+    if not user:
+        logger.warning(f"[{function_name}] 登录失败：密钥无效或已撤销")
+        raise HTTPException(status_code=401, detail="访问密钥无效或已撤销")
+
+    set_session_cookie(response, payload.key)
+    logger.info(f"[{function_name}] 登录成功：{user['name']}（{user['role']}，租户 {user['tenant_id']}）")
+    return {"code": 200, "name": user["name"], "role": user["role"]}
+
+
+@app.post("/logout", summary="退出登录")
+async def logout(response: Response):
+    """清掉会话 Cookie"""
+    clear_session_cookie(response)
+    return {"code": 200}
 
 
 @app.get("/import.html", response_class=FileResponse, summary="文件上传页面")
 async def get_import_page():
-    """返回前端上传页面"""
+    """返回前端上传页面（页面本身公开，数据接口才要密钥）"""
     html_abs_path = PROJECT_ROOT / "app/import_process/page/import.html"
     if not os.path.exists(html_abs_path):
         logger.error(f"前端页面文件不存在：{html_abs_path}")
@@ -149,7 +192,7 @@ def _save_upload_file(file: UploadFile, dest_path: str) -> None:
         shutil.copyfileobj(file.file, buffer, length=1024 * 1024)
 
 
-@app.post("/upload", summary="文件上传接口")
+@app.post("/upload", summary="文件上传接口", dependencies=[Depends(current_tenant)])
 async def upload_files(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(..., description="待导入的文件（PDF/MD），支持多选"),
@@ -261,7 +304,7 @@ async def upload_files(
     }
 
 
-@app.get("/status/{task_id}", summary="任务状态查询")
+@app.get("/status/{task_id}", summary="任务状态查询", dependencies=[Depends(current_tenant)])
 async def get_task_progress(task_id: str):
     """
     查询单个任务的处理进度（前端每2秒轮询）
@@ -276,7 +319,7 @@ async def get_task_progress(task_id: str):
     }
 
 
-@app.get("/documents", summary="已导入文档列表")
+@app.get("/documents", summary="已导入文档列表", dependencies=[Depends(current_tenant)])
 async def list_imported_documents():
     """
     列出已导入的文档（以 Milvus 为准聚合，历史文档也能列出）
@@ -288,7 +331,7 @@ async def list_imported_documents():
     return {"code": 200, "total": len(documents), "documents": documents}
 
 
-@app.get("/documents/graph", summary="查询单文档知识图谱")
+@app.get("/documents/graph", summary="查询单文档知识图谱", dependencies=[Depends(current_tenant)])
 async def get_document_graph(file_title: str):
     """
     读取一份文档在 Neo4j 里的实体-关系图，供前端可视化
@@ -326,7 +369,7 @@ async def get_document_graph(file_title: str):
     }
 
 
-@app.delete("/documents/{file_title}", summary="撤回已导入文档")
+@app.delete("/documents/{file_title}", summary="撤回已导入文档", dependencies=[Depends(current_tenant)])
 async def revoke_document_api(file_title: str, confirm: bool = False):
     """
     撤回一份已导入文档：删除 Milvus 切片与产品名、SQLite 去重记录、本地产物、MinIO 对象

@@ -83,6 +83,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 **导入服务**（`file_import_service.py`，端口 **8001**）已完成：
 
+- `POST /login` / `POST /logout` —— 用访问密钥换 / 清 HttpOnly 会话 Cookie
 - `POST /upload` —— 上传 + **SHA-256 内容去重**（改名仍能识别）+ `force=true` 强制重导
 - `GET /documents` —— 已导入文档列表（以 Milvus 为主聚合，附图谱实体数）
 - `GET /documents/graph?file_title=` —— 单文档知识图谱（实体 + 关系，供前端可视化）
@@ -106,6 +107,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 **查询服务**（`query_service.py`，端口 **8002**）已完成：
 
+- `POST /login` / `POST /logout` —— 用访问密钥换 / 清 HttpOnly 会话 Cookie
 - `POST /query` —— 提交问题（流式返回 session_id / 非流式直接返回 `answer` + `images`）
 - `GET /stream/{session_id}` —— **SSE** 推送 `ready` / `progress` / `delta` / `final` / `error`（`final` 带 `answer` 与 `images`）
 - `GET /history/{session_id}`、`DELETE /history/{session_id}` —— 会话历史查询与清空
@@ -115,7 +117,10 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 暂无。导入链路与检索链路共 16 个节点均已实现并验证。
 
-后续可做的方向（非阻塞）：给图谱侧排序做更可靠的权重、把其余 4 份文档重新导入以生成图谱、答案里引用的图片做去重与缩略图。
+**企业级改造**（可观测性、Durable Execution、多租户、治理）的完整路线见
+[HANDOFF.md](HANDOFF.md) 第 3.5 节 —— 那里有分阶段清单与优先级建议，本文不重复。
+
+零散的后续方向：给图谱侧排序做更可靠的权重、把其余 4 份文档重新导入以生成图谱、答案配图做去重与缩略图。
 
 ---
 
@@ -219,6 +224,32 @@ docker compose -f docker/neo4j-compose.yml up -d
 # 单节点测试
 .venv/Scripts/python.exe -m app.query_process.agent.nodes.node_item_name_confirm
 ```
+
+---
+
+## 访问鉴权
+
+数据接口需要**访问密钥**；页面本身与 `/health` 保持公开。
+
+```bash
+# 建第一个用户（密钥只在这一刻打印一次，丢了只能重建）
+.venv/Scripts/python.exe -m app.clients.mongo_user_utils add 张三 admin
+.venv/Scripts/python.exe -m app.clients.mongo_user_utils list      # 查看
+.venv/Scripts/python.exe -m app.clients.mongo_user_utils revoke 张三  # 撤销
+```
+
+两种提交方式，任选其一：
+
+- `Authorization: Bearer <key>` —— 给脚本 / 程序化调用
+- 浏览器访问任意页面 → 接口返回 401 时自动弹出密钥输入框 → 登录成功后写入 HttpOnly Cookie
+
+**为什么浏览器侧走 Cookie 而不是让前端存密钥发请求头**：查询服务的流式接口用的是 `EventSource`，
+而它**无法自定义请求头**——Bearer 头在那条路上根本发不出去。Cookie 由浏览器自动携带，
+页面里十几处 `fetch` 与那个 `EventSource` 一行都不用改。
+
+**当前只做「认证」、不做「数据隔离」**：密钥对应一个 `tenant_id`，但数据还没按它隔离
+（给 Milvus / Neo4j / MongoDB / MinIO 四个存储加租户维度是停机迁移级别的改动）。
+所以**现阶段任何有效密钥都能看到全部数据**。这一层的价值是把身份打通、为后续隔离留好接口。
 
 ---
 

@@ -3,6 +3,8 @@
 .env
 .env.*
 !.env.example
+# 本机访问密钥（明文），仅本机使用
+admin-key.txt
 
 # ===== 运行产物 =====
 # output/ 是按文档隔离的中间产物（md、图片、chunks.json、解析结果 zip），体积大且可重新生成

@@ -478,6 +478,32 @@
   .empty { color: var(--ink-dim); font-size: 13px; }
   .hidden { display: none !important; }
 
+  /* 访问密钥登录层：任何接口返回 401 时弹出 */
+  .login-mask {
+    position: fixed; inset: 0; z-index: 60; display: flex;
+    align-items: center; justify-content: center; padding: 20px;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    backdrop-filter: blur(3px);
+  }
+  .login-mask[hidden] { display: none; }
+  .login-box {
+    width: 100%; max-width: 340px; padding: 24px;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--r-md); box-shadow: var(--shadow);
+  }
+  .login-box h2 { margin: 0 0 6px; font-size: 16px; font-weight: 600; }
+  .login-box p { margin: 0 0 16px; font-size: 12.5px; color: var(--ink-dim); }
+  .login-box input { width: 100%; margin-bottom: 12px; }
+  .login-btn {
+    width: 100%; padding: 8px; cursor: pointer; font-size: 13px;
+    color: var(--accent-ink); background: var(--accent);
+    border: 1px solid var(--accent); border-radius: var(--r-sm);
+    transition: opacity .18s;
+  }
+  .login-btn:hover:not(:disabled) { opacity: .88; }
+  .login-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .login-err { margin-top: 10px; font-size: 12.5px; color: var(--fail); min-height: 17px; }
+
   /* 滚动条 */
   #main::-webkit-scrollbar { width: 9px; }
   #main::-webkit-scrollbar-thumb {
@@ -609,9 +635,61 @@
 </div>
 </main>
 
+<!-- 访问密钥登录层：接口返回 401 时弹出 -->
+<div class="login-mask" id="loginMask" hidden>
+  <div class="login-box">
+    <h2>需要访问密钥</h2>
+    <p>请输入分配给你的访问密钥</p>
+    <input id="loginKey" class="revoke-input" type="password" placeholder="访问密钥" autocomplete="current-password">
+    <button class="login-btn" id="loginBtn">进入</button>
+    <div class="login-err" id="loginErr"></div>
+  </div>
+</div>
+
 <script>
 const API = '';
 const $ = (id) => document.getElementById(id);
+
+/* ---------- 访问鉴权 ---------- */
+// 包一层 fetch 统一拦 401，页面上十来处调用一处都不用改
+const _origFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const res = await _origFetch(...args);
+  if (res.status === 401) showLogin();
+  return res;
+};
+
+function showLogin() {
+  const m = $('loginMask');
+  if (m.hidden) { m.hidden = false; $('loginKey').focus(); }
+}
+
+async function doLogin() {
+  const key = $('loginKey').value.trim();
+  const err = $('loginErr');
+  if (!key) { err.textContent = '请输入访问密钥'; return; }
+
+  const btn = $('loginBtn');
+  btn.disabled = true; btn.textContent = '校验中…';
+  err.textContent = '';
+  try {
+    const r = await fetch('/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    if (!r.ok) { err.textContent = '密钥无效或已撤销'; return; }
+    // 服务端已种下 Cookie，重新加载即可带着身份跑
+    location.reload();
+  } catch (e) {
+    err.textContent = '无法连接服务';
+  } finally {
+    btn.disabled = false; btn.textContent = '进入';
+  }
+}
+
+$('loginBtn').onclick = doLogin;
+$('loginKey').onkeydown = (e) => { if (e.key === 'Enter') doLogin(); };
 let picked = [];        // 待上传文件
 let tasks = {};         // task_id -> {filename, timer}
 

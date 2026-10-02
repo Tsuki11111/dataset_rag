@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
@@ -27,6 +27,7 @@ from starlette.middleware.cors import CORSMiddleware
 from app.clients.mongo_history_utils import clear_history, get_recent_messages
 from app.core.logger import logger
 from app.query_process.agent.main_graph import query_app
+from app.utils.auth_utils import clear_session_cookie, current_tenant, set_session_cookie
 from app.utils.sse_utils import SSEEvent, create_sse_queue, push_to_session, sse_generator
 from app.utils.task_utils import (
     TASK_STATUS_COMPLETED,
@@ -103,6 +104,59 @@ def run_query_graph(session_id: str, user_query: str, is_stream: bool = True):
             push_to_session(session_id, SSEEvent.ERROR, {"error": str(e)})
 
 
+class LoginRequest(BaseModel):
+    """登录请求：提交访问密钥"""
+    key: str
+
+
+@app.on_event("startup")
+async def on_startup():
+    """
+    服务启动时预热用户表
+
+    顺带检查有没有用户——一个都没有时所有数据接口都会 401，提前把话说明白。
+    """
+    from app.clients.mongo_user_utils import count_users, get_user_tool
+    get_user_tool()
+    logger.info("用户工具已就绪（MongoDB）")
+    if count_users() == 0:
+        logger.warning(
+            "还没有任何用户，数据接口将全部返回 401。"
+            "先建一个：.venv/Scripts/python.exe -m app.clients.mongo_user_utils add <称呼>"
+        )
+
+
+@app.post("/login", summary="登录：校验访问密钥并写入会话 Cookie")
+async def login(payload: LoginRequest, response: Response):
+    """
+    用访问密钥换一个 HttpOnly Cookie
+
+    走 Cookie 而不是让前端存密钥发请求头：本服务的流式接口用 `EventSource`，
+    它**无法自定义请求头**，只有 Cookie 能被浏览器自动携带。
+    """
+    function_name = sys._getframe().f_code.co_name
+    from app.clients.mongo_user_utils import verify_key
+
+    user = verify_key(payload.key)
+    if not user:
+        logger.warning(f"[{NODE_NAME}] [{function_name}] 登录失败：密钥无效或已撤销")
+        raise HTTPException(status_code=401, detail="访问密钥无效或已撤销")
+
+    set_session_cookie(response, payload.key)
+    logger.info(
+        f"[{NODE_NAME}] [{function_name}] 登录成功：{user['name']}"
+        f"（{user['role']}，租户 {user['tenant_id']}）"
+    )
+    return {"code": 200, "name": user["name"], "role": user["role"]}
+
+
+@app.post("/logout", summary="退出登录")
+async def logout(response: Response):
+    """清掉会话 Cookie"""
+    clear_session_cookie(response)
+    return {"code": 200}
+
+
 @app.get("/chat.html", summary="聊天页面")
 async def chat():
     """返回前端聊天页面"""
@@ -114,7 +168,7 @@ async def chat():
     return FileResponse(page_path, media_type="text/html")
 
 
-@app.post("/query", summary="提交查询")
+@app.post("/query", summary="提交查询", dependencies=[Depends(current_tenant)])
 async def query(background_tasks: BackgroundTasks, request: QueryRequest):
     """
     接收用户提问并启动后台检索流程
@@ -156,7 +210,7 @@ async def query(background_tasks: BackgroundTasks, request: QueryRequest):
     }
 
 
-@app.get("/stream/{session_id}", summary="SSE 流式获取结果")
+@app.get("/stream/{session_id}", summary="SSE 流式获取结果", dependencies=[Depends(current_tenant)])
 async def stream(session_id: str, request: Request):
     """
     建立 SSE 长连接，实时推送任务进度与生成文本
@@ -187,7 +241,7 @@ async def health():
     return {"ok": True}
 
 
-@app.get("/history/{session_id}", summary="查询会话历史")
+@app.get("/history/{session_id}", summary="查询会话历史", dependencies=[Depends(current_tenant)])
 async def get_history(session_id: str, limit: int = 50):
     """
     查询指定会话的历史对话记录（时间正序）
@@ -216,7 +270,7 @@ async def get_history(session_id: str, limit: int = 50):
     return {"session_id": session_id, "items": items}
 
 
-@app.delete("/history/{session_id}", summary="清空会话历史")
+@app.delete("/history/{session_id}", summary="清空会话历史", dependencies=[Depends(current_tenant)])
 async def clear_session_history(session_id: str):
     """删除指定会话的全部历史对话记录"""
     function_name = sys._getframe().f_code.co_name
