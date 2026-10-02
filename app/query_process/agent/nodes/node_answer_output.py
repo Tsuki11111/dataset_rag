@@ -130,6 +130,10 @@ def _generate(session_id: str, messages: list, is_stream: bool) -> str:
 
     流式模式下逐块推送 delta。**图片区块不推给前端**——它只是给节点解析用的，
     一旦读到标记就停止推送（但仍继续累积原文，否则解析不出链接）。
+
+    **标记可能被切在两个 chunk 之间**（先到「【」、下一块才是「图片】」），
+    所以末尾要扣住 len(IMAGE_MARKER)-1 个字符不推：它们随时可能是标记的前缀。
+    不扣的话，那个孤零零的「【」会跟着打字机一起闪过去。
     """
     llm = get_llm_client()
 
@@ -137,6 +141,7 @@ def _generate(session_id: str, messages: list, is_stream: bool) -> str:
         resp = llm.invoke(messages)
         return (getattr(resp, "content", "") or "").strip()
 
+    hold = len(IMAGE_MARKER) - 1   # 可能是标记前缀的尾部字符数
     buf = ""
     pushed = 0          # 已推送给前端的字符数
     cut = None          # 图片区块的起始位置
@@ -149,10 +154,15 @@ def _generate(session_id: str, messages: list, is_stream: bool) -> str:
             idx = buf.find(IMAGE_MARKER)
             if idx >= 0:
                 cut = idx
-        visible_end = cut if cut is not None else len(buf)
+        # 还没出现完整标记时，末尾 hold 个字符先按兵不动
+        visible_end = cut if cut is not None else max(0, len(buf) - hold)
         if visible_end > pushed:
             push_to_session(session_id, SSEEvent.DELTA, {"delta": buf[pushed:visible_end]})
             pushed = visible_end
+
+    # 收尾：确认没有标记就把扣住的那截补推出去（有标记则正文已在 cut 处截断）
+    if cut is None and len(buf) > pushed:
+        push_to_session(session_id, SSEEvent.DELTA, {"delta": buf[pushed:]})
     return buf.strip()
 
 
@@ -237,15 +247,85 @@ def node_answer_output(state: QueryGraphState) -> QueryGraphState:
         logger.info(f"[{NODE_NAME}] [{function_name}] 节点处理结束")
 
 
+def _check_stream_boundary() -> list:
+    """
+    离线自测：图片标记的流式边界（不调任何接口，纯逻辑）
+
+    这块曾经有 bug：模型把「【图片】」切成「【」+「图片】」两块时，第一个 chunk
+    处理完时 `buf.find()` 还找不到完整标记，那个孤零零的「【」就被推给前端、
+    跟着打字机闪过去。修法是推之前先扣住 len(IMAGE_MARKER)-1 个字符。
+
+    不变量：**推给前端的正文，必须等于最终答案里图片区块之前的部分**——
+    少推会吞字，多推会漏出标记或裸 URL。
+
+    :return: 问题描述列表，空表示全部通过
+    """
+    problems = []
+
+    class _FakeChunk:
+        def __init__(self, content):
+            self.content = content
+
+    class _FakeLLM:
+        def __init__(self, pieces):
+            self.pieces = pieces
+
+        def stream(self, messages):
+            for p in self.pieces:
+                yield _FakeChunk(p)
+
+    real_push, real_get = push_to_session, get_llm_client
+    try:
+        def _run(pieces):
+            deltas = []
+            globals()["push_to_session"] = lambda sid, ev, data: deltas.append(data.get("delta"))
+            globals()["get_llm_client"] = lambda *a, **k: _FakeLLM(pieces)
+            raw = _generate("boundary_test", [], True)   # 必须先跑完再 join
+            return "".join(deltas), raw
+
+        pushed, raw = _run(["安装步骤如下。", "说明。", "【", "图片", "】", "http://a/1.jpg"])
+        if "【" in pushed:
+            problems.append(f"标记被切块时前缀泄漏：{pushed!r}")
+        if pushed != "安装步骤如下。说明。":
+            problems.append(f"切块场景正文推送不完整：{pushed!r}")
+        if "【图片】" not in raw:
+            problems.append("原文应保留标记，否则节点解析不出图片")
+
+        pushed, raw = _run(["普通", "回答", "结束"])
+        if pushed != raw or pushed != "普通回答结束":
+            problems.append(f"无标记时尾部被吞或与原文不一致：{pushed!r}")
+
+        pushed, _ = _run(["答案正文", "【图片】http://a/2.jpg"])
+        if pushed != "答案正文":
+            problems.append(f"标记整块到达时推送不对：{pushed!r}")
+
+        # 流恰好停在半个标记上：它是真实正文（final 里也有），必须补推，前后一致
+        pushed, raw = _run(["答案", "【图"])
+        if pushed != raw:
+            problems.append(f"流结束时推送与原文不一致：{pushed!r} != {raw!r}")
+    finally:
+        globals()["push_to_session"], globals()["get_llm_client"] = real_push, real_get
+
+    return problems
+
+
 if __name__ == '__main__':
     """
-    本地测试：走真实检索 → 真实生成
+    本地测试：先跑离线的流式边界用例，再走真实检索 → 真实生成
 
     前置：Milvus / Neo4j / MongoDB 均在运行
     """
     from app.query_process.agent.main_graph import query_app
     from app.query_process.agent.state import create_query_default_state
     from app.utils.task_utils import clear_task
+
+    logger.info("=" * 70)
+    logger.info("[测试] 图片标记流式边界（离线，不调接口）")
+    boundary_problems = _check_stream_boundary()
+    for p in boundary_problems:
+        logger.error(f"[测试] [FAIL] {p}")
+    if not boundary_problems:
+        logger.success("[测试] [PASS] 流式边界四个场景全部通过")
 
     cases = [
         ("正常问答", "Brother HAK 180 烫金机怎么安装烫金膜盒？"),
@@ -280,4 +360,7 @@ if __name__ == '__main__':
             clear_task(session_id)
 
     logger.info("=" * 70)
-    logger.info("[测试] 全部用例执行完毕")
+    if boundary_problems:
+        logger.error(f"[测试] 有 {len(boundary_problems)} 项流式边界用例未通过（见上文）")
+    else:
+        logger.info("[测试] 全部用例执行完毕")
