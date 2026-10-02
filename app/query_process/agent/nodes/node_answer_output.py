@@ -9,7 +9,8 @@
 
 **图片的处理**：`prompts/answer_out.prompt` 要求模型在答案末尾追加一个【图片】区块，
 本节点把它拆出来单独作为 `images` 返回（每项含 `url` 与图注），并从正文里去掉
-（用户不必看到一堆裸链接）。图注取自该图所在切片的标题。
+（用户不必看到一堆裸链接）。**图注取自该图的 alt 文本**——那是导入时视觉模型写下的、
+描述图里实际内容的文字；alt 为空或是占位（`图片`）时才退回用章节标题。
 
 **只放行参考内容里真实出现过的 URL** —— 模型可能编造或改写链接，
 直接透传会让前端显示一排破图。
@@ -36,8 +37,10 @@ HISTORY_LIMIT = 6
 MAX_CONTEXT_CHARS_PER_DOC = 1200
 # 图片区块标记，与 prompts/answer_out.prompt 里的约定一致
 IMAGE_MARKER = "【图片】"
-# 从切片正文里抓 Markdown 图片链接 ![](url)
-MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
+# 从切片正文里抓 Markdown 图片链接：group(1)=alt 文本，group(2)=URL
+MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
+# node_md_img 生成图片描述失败时会写入的占位 alt，这种要退回用章节标题当图注
+IMAGE_ALT_PLACEHOLDER = "图片"
 # 一片都没检索到时的兜底答复（此时调 LLM 只会让它凭空编）
 FALLBACK_ANSWER = "抱歉，没有检索到与该问题相关的内容。可以换个说法，或确认一下产品型号。"
 
@@ -46,10 +49,13 @@ SYSTEM_PROMPT = "你是产品使用文档的问答助手。回答必须严格基
 
 def _build_context(docs: list):
     """
-    把重排后的切片拼成参考内容，同时记下每个图片 URL 出自哪条切片
+    把重排后的切片拼成参考内容，同时记下每个图片 URL 出自哪条切片、图里画的是什么
 
-    返回的 captions 一举两得：既当**白名单**（放行只在它里面出现过的 URL），
-    又给前端提供**图注**（用来源切片的标题）。
+    图注优先取**视觉模型写的 alt 文本**——导入时 `node_md_img` 已经让多模态模型看过每张图，
+    描述的是图里实际有什么（如「打开烫金膜盒支架盖，按箭头方向将烫金膜盒插入支架」）。
+    章节标题只作兜底：同一个章节下常有多张不同的图，用标题会导致它们图注一模一样。
+
+    返回的 captions 一举两得：既当**白名单**（放行只在它里面出现过的 URL），又给前端提供**图注**。
 
     :return: (context 文本, {url: 图注})
     """
@@ -58,11 +64,13 @@ def _build_context(docs: list):
         text = (doc.get("text") or "").strip()
         if not text:
             continue
-        # 切片标题形如 "## 3.4.2 装入半幅烫金膜盒"，去掉井号当图注更干净
+        # 切片标题形如 "## 3.4.2 装入半幅烫金膜盒"，去掉井号当兜底图注更干净
         title = (doc.get("title") or "").strip().lstrip("#").strip()
         parts.append(f"[{i}] {title}\n{text[:MAX_CONTEXT_CHARS_PER_DOC]}")
-        for url in MARKDOWN_IMAGE_RE.findall(text):
-            captions.setdefault(url, title)
+        for m in MARKDOWN_IMAGE_RE.finditer(text):
+            alt, url = m.group(1).strip(), m.group(2)
+            caption = alt if alt and alt != IMAGE_ALT_PLACEHOLDER else title
+            captions.setdefault(url, caption)
     return "\n\n".join(parts), captions
 
 
