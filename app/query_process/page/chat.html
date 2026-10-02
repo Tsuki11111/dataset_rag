@@ -222,7 +222,81 @@
     border-radius: var(--r-lg); box-shadow: var(--shadow); overflow: hidden;
   }
   .answer-body { padding: 20px 22px; }
-  .answer-body .txt { white-space: pre-wrap; word-break: break-word; }
+  /* 答案正文由 renderMarkdown 渲染成块级元素，所以这里用常规空白处理（不再是 pre-wrap） */
+  .answer-body .txt { word-break: break-word; line-height: 1.78; }
+  .answer-body .txt > :first-child { margin-top: 0; }
+  .answer-body .txt > :last-child { margin-bottom: 0; }
+  .answer-body .txt p { margin: 0 0 14px; }
+
+  /* 标题：层级分明但不喧宾夺主 */
+  .answer-body .txt h1, .answer-body .txt h2, .answer-body .txt h3,
+  .answer-body .txt h4, .answer-body .txt h5, .answer-body .txt h6 {
+    margin: 24px 0 10px; font-weight: 600; line-height: 1.4; letter-spacing: -.01em;
+  }
+  .answer-body .txt h1 { font-size: 19px; }
+  .answer-body .txt h2 { font-size: 17px; }
+  .answer-body .txt h3 { font-size: 15.5px; }
+  .answer-body .txt h4, .answer-body .txt h5, .answer-body .txt h6 { font-size: 14.5px; color: var(--ink-2); }
+
+  /* 列表：序号用强调色，看起来更像一篇排版过的文档 */
+  .answer-body .txt ol, .answer-body .txt ul { margin: 0 0 14px; padding-left: 24px; }
+  .answer-body .txt li { margin: 6px 0; padding-left: 2px; }
+  .answer-body .txt li::marker { color: var(--accent); }
+  .answer-body .txt li > ul, .answer-body .txt li > ol { margin: 6px 0 0; }
+
+  .answer-body .txt strong { font-weight: 600; }
+  .answer-body .txt em { font-style: italic; color: var(--ink-2); }
+
+  .answer-body .txt code {
+    font-family: var(--font-mono); font-size: .88em; padding: 1px 5px;
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 4px;
+  }
+  .answer-body .txt pre {
+    margin: 0 0 14px; padding: 12px 14px; overflow-x: auto;
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm);
+  }
+  .answer-body .txt pre code {
+    padding: 0; border: none; background: none; font-size: 12.5px; line-height: 1.6;
+  }
+
+  .answer-body .txt a {
+    color: var(--accent); text-decoration: none;
+    border-bottom: 1px solid var(--accent-soft);
+  }
+  .answer-body .txt a:hover { border-bottom-color: var(--accent); }
+
+  .answer-body .txt blockquote {
+    margin: 0 0 14px; padding: 10px 16px; color: var(--ink-2);
+    border-left: 3px solid var(--accent); background: var(--accent-soft);
+    border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  }
+  .answer-body .txt hr { margin: 22px 0; border: none; border-top: 1px solid var(--line); }
+
+  /* 答案配图：做成带标号与图注的图卡，并用一条分隔线把它和正文分开，
+     避免几张裸图突然堆在末尾显得突兀 */
+  .answer-figs { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+  .answer-figs:empty { display: none; }
+  .figs-head {
+    margin-bottom: 12px; font-size: 11.5px; letter-spacing: .08em;
+    color: var(--ink-dim); font-family: var(--font-mono);
+  }
+  .figs-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
+  .fig {
+    margin: 0; overflow: hidden; background: var(--surface-2);
+    border: 1px solid var(--line); border-radius: var(--r-md);
+  }
+  .fig img { width: 100%; display: block; cursor: zoom-in; background: var(--bg); }
+  .fig figcaption {
+    padding: 9px 12px; font-size: 12.5px; line-height: 1.5; color: var(--ink-2);
+    border-top: 1px solid var(--line);
+  }
+  /* 切片标题常自带章节号（如「3.4.1 装入全幅烫金膜盒」），
+     与「图 N」编号挨太近会被读成一个数字，所以上面把间距留大到 9px */
+  .fig-no {
+    display: inline-block; margin-right: 9px; padding: 1px 7px;
+    font-family: var(--font-mono); font-size: 11px; border-radius: 999px;
+    color: var(--accent); background: var(--accent-soft);
+  }
   .caret {
     display: inline-block; width: 8px; height: 16px; margin-left: 1px;
     background: var(--accent); vertical-align: -3px;
@@ -466,6 +540,118 @@ function esc(s) {
 }
 
 /* ============================================================
+   极简 Markdown 渲染
+   覆盖：标题、代码块、粗体/斜体/行内代码、链接、有序/无序列表（含一层嵌套）、
+   引用块、分隔线、段落。
+   **先整体 esc 再解析**——答案里可能夹着文档正文，不转义就等于把切片内容当标签执行。
+   注意 esc 之后 ">" 已变成 "&gt;"，所以引用块要用转义后的写法判断。
+   ============================================================ */
+function inlineMd(s) {
+  // 先把行内代码抽出来占位，否则里面的 * 会被后面当成粗体解析
+  const codes = [];
+  let t = s.replace(/`([^`]+)`/g, (m, c) => {
+    codes.push(c);
+    return '\u0000' + (codes.length - 1) + '\u0000';
+  });
+  t = t
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    // 粗体已经先被吃掉，剩下的 *…* 当斜体；不加左边界断言，
+    // 否则 "中文标点*斜体*" 这种写法（前面不是空格）会漏掉
+    .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+    // 只放行 http(s) 与本域路径，挡掉 javascript: 之类的伪协议
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, url) =>
+      /^(https?:\/\/|\/)/i.test(url)
+        ? `<a href="${url}" target="_blank" rel="noopener">${text}</a>`
+        : m);
+  return t.replace(/\u0000(\d+)\u0000/g, (m, i) => '<code>' + codes[+i] + '</code>');
+}
+
+function renderMarkdown(md) {
+  const out = [];
+  let list = null;    // { tag: 'ol'|'ul', items: [{text, subs: []}] }
+  let para = [];
+  let fence = null;   // 代码围栏内的行，围栏里一律不做 Markdown 解析
+
+  const flushPara = () => {
+    if (para.length) { out.push('<p>' + inlineMd(para.join('<br>')) + '</p>'); para = []; }
+  };
+  const flushList = () => {
+    if (!list) return;
+    const body = list.items.map(it =>
+      '<li>' + inlineMd(it.text) +
+      (it.subs.length
+        ? '<ul>' + it.subs.map(s => '<li>' + inlineMd(s) + '</li>').join('') + '</ul>'
+        : '') +
+      '</li>').join('');
+    out.push('<' + list.tag + '>' + body + '</' + list.tag + '>');
+    list = null;
+  };
+  const pushItem = (tag, text) => {
+    if (list && list.tag !== tag) {
+      // 有序列表后紧跟的无序项按「嵌套」处理（模型就是这样表达子步骤的）
+      if (tag === 'ul' && list.tag === 'ol' && list.items.length) {
+        list.items[list.items.length - 1].subs.push(text);
+        return;
+      }
+      flushList();
+    }
+    if (!list) list = { tag, items: [] };
+    list.items.push({ text, subs: [] });
+  };
+
+  for (const raw of esc(md || '').split('\n')) {
+    const line = raw.replace(/\s+$/, '');   // 行尾双空格是 Markdown 的硬换行标记，去掉
+    const t = line.trim();
+
+    if (t.startsWith('```')) {              // 围栏开合
+      if (fence === null) { flushPara(); flushList(); fence = []; }
+      else { out.push('<pre><code>' + fence.join('\n') + '</code></pre>'); fence = null; }
+      continue;
+    }
+    if (fence !== null) { fence.push(line); continue; }
+
+    if (!t) { flushPara(); flushList(); continue; }
+
+    const h  = t.match(/^(#{1,6})\s+(.+)$/);
+    const hr = /^(-{3,}|\*{3,}|_{3,})$/.test(t);
+    const ol = t.match(/^\d+\.\s+(.+)$/);
+    const ul = t.match(/^[-*]\s+(.+)$/);
+    const bq = t.match(/^&gt;\s?(.*)$/);
+
+    if (h) {
+      flushPara(); flushList();
+      const lv = h[1].length;
+      out.push('<h' + lv + '>' + inlineMd(h[2]) + '</h' + lv + '>');
+    } else if (hr) {
+      flushPara(); flushList(); out.push('<hr>');
+    } else if (ol || ul) {
+      flushPara();
+      pushItem(ol ? 'ol' : 'ul', (ol ? ol[1] : ul[1]).trim());
+    } else if (bq) {
+      flushPara(); flushList();
+      out.push('<blockquote>' + inlineMd(bq[1].trim()) + '</blockquote>');
+    } else {
+      flushList();
+      para.push(t);
+    }
+  }
+  flushPara(); flushList();
+  if (fence !== null && fence.length) {     // 流式中途被截断的围栏，也要收尾
+    out.push('<pre><code>' + fence.join('\n') + '</code></pre>');
+  }
+  return out.join('');
+}
+
+/* 把文本渲染进答案区；流式过程中在末尾补一个光标 */
+function paintAnswer(ctx, text, withCaret) {
+  ctx.txt.innerHTML = renderMarkdown(text);
+  if (!withCaret) return;
+  const c = document.createElement('span');
+  c.className = 'caret';
+  (ctx.txt.lastElementChild || ctx.txt).appendChild(c);
+}
+
+/* ============================================================
    主题
    ============================================================ */
 $('themeBtn').onclick = () => {
@@ -556,6 +742,7 @@ function addAnswer() {
         <div class="pipeline-body" id="pipeBody">${lanes}</div>
       </div>
       <div class="answer-body"><div class="txt" id="txt"></div></div>
+      <div class="answer-figs" id="figs"></div>
     </div>`;
 
   column.appendChild(el);
@@ -579,7 +766,25 @@ function addAnswer() {
     title: el.querySelector('#pipeTitle'),
     count: el.querySelector('#pipeCount'),
     txt: el.querySelector('#txt'),
+    figs: el.querySelector('#figs'),
+    buf: '',            // 流式累积的答案原文，每次重渲染整段
   };
+}
+
+/* 渲染答案配图：带标号与图注的图卡；点图在新标签页看原图 */
+function renderImages(ctx, images) {
+  const list = images || [];
+  if (!list.length) { ctx.figs.innerHTML = ''; return; }
+  ctx.figs.innerHTML =
+    `<div class="figs-head">相关图片 · ${list.length} 张</div>` +
+    '<div class="figs-grid">' +
+    list.map((it, i) => `
+      <figure class="fig">
+        <img src="${esc(it.url)}" alt="${esc(it.caption || '参考图片')}" loading="lazy"
+             onclick="window.open(this.src,'_blank')">
+        <figcaption><span class="fig-no">图 ${i + 1}</span>${esc(it.caption || '未标注来源')}</figcaption>
+      </figure>`).join('') +
+    '</div>';
 }
 
 /* ============================================================
@@ -660,18 +865,17 @@ async function streamFlow(query, ctx) {
 
   eventSource.addEventListener('delta', (e) => {
     const d = JSON.parse(e.data);
-    const cur = ctx.txt.querySelector('.caret');
-    if (cur) cur.remove();
-    ctx.txt.append(document.createTextNode(d.delta ?? d.text ?? ''));
-    const c = document.createElement('span');
-    c.className = 'caret';
-    ctx.txt.appendChild(c);
+    // 整段重渲染而不是追加文本节点：Markdown 是上下文相关的（列表要凑齐才能成块）
+    ctx.buf += (d.delta ?? d.text ?? '');
+    paintAnswer(ctx, ctx.buf, true);
     scrollDown();
   });
 
   eventSource.addEventListener('final', (e) => {
     const d = JSON.parse(e.data);
-    ctx.txt.textContent = d.answer || '';
+    ctx.buf = d.answer || '';
+    paintAnswer(ctx, ctx.buf, false);
+    renderImages(ctx, d.images);
     // 收尾：最后一个 progress 可能早于 final 到达（那时 status 仍是 processing），
     // 所以在这里补一次完成态，保证泳道与标题都是最终状态
     const n = renderPipeline(ctx, ALL_NODES, []);
@@ -730,7 +934,8 @@ async function syncFlow(query, ctx) {
     });
     const d = await r.json();
     if (d.session_id) sessionId = d.session_id;
-    ctx.txt.textContent = d.answer || '（未返回答案）';
+    paintAnswer(ctx, d.answer || '（未返回答案）', false);
+    renderImages(ctx, d.images);
     if (d.done_list && d.done_list.length) {
       const n = renderPipeline(ctx, d.done_list, []);
       ctx.title.textContent = '检索完成';

@@ -91,7 +91,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 ### 检索链路 —— 部分完成 🚧
 
-8 个节点已完成 7 个，只剩 `node_answer_output` 一个半成品。
+8 个节点全部完成 ✅
 
 | 节点 | 状态 | 说明 |
 |---|---|---|
@@ -102,18 +102,20 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 | `node_query_kg` | ✅ | 图谱检索：问题里的实体 → 种子 + 一跳邻居 → 取回切片（正文回 Milvus 取）；图内实测召回 5 条，4 条进 RRF |
 | `node_rrf` | ✅ | 加权 RRF 融合切片类召回（基线 / HyDE / 图谱，k=60）→ `rrf_chunks`；图内实测 5+5 输入去重融合为 6 条 |
 | `node_rerank` | ✅ | 合并本地切片 + 联网结果为统一格式 → DashScope 重排打分 → 动态 Top-K（断崖截断）→ `reranked_docs`；图内实测 6+5 输入输出 8 条 |
-| `node_answer_output` | 🚧 | SSE 流式推送与历史存档已完成；**答案内容仍是占位文本**，未接 LLM 生成 |
+| `node_answer_output` | ✅ | 用 `reranked_docs` 组装上下文调 LLM 生成答案；流式逐块推送，解析【图片】区块作为配图；答案存档 |
 
 **查询服务**（`query_service.py`，端口 **8002**）已完成：
 
-- `POST /query` —— 提交问题（流式返回 session_id / 非流式直接返回答案）
-- `GET /stream/{session_id}` —— **SSE** 推送 `ready` / `progress` / `delta` / `final` / `error`
+- `POST /query` —— 提交问题（流式返回 session_id / 非流式直接返回 `answer` + `image_urls`）
+- `GET /stream/{session_id}` —— **SSE** 推送 `ready` / `progress` / `delta` / `final` / `error`（`final` 带 `answer` 与 `image_urls`）
 - `GET /history/{session_id}`、`DELETE /history/{session_id}` —— 会话历史查询与清空
-- 前端 [chat.html](app/query_process/page/chat.html)：检索管线可视化、流式答案、昼夜模式
+- 前端 [chat.html](app/query_process/page/chat.html)：检索管线可视化、流式答案（**Markdown 渲染**）、**答案配图**、昼夜模式
 
 ### 未开始 ⬜
 
-- 答案生成（`node_answer_output` 仍输出占位文本，这是最后一块）
+暂无。导入链路与检索链路共 16 个节点均已实现并验证。
+
+后续可做的方向（非阻塞）：给图谱侧排序做更可靠的权重、把其余 4 份文档重新导入以生成图谱、答案里引用的图片做去重与缩略图。
 
 ---
 
@@ -333,6 +335,23 @@ docker compose -f docker/neo4j-compose.yml up -d
 
 另外两点渲染取舍：**切片不作为节点画进图**（84 个切片会把 257 个实体淹没），改为悬停实体时用 tooltip 告知它出现在几个切片里；**标签默认不显示**，只在悬停与缩放 ≥1.5 倍时出现，否则 257 个中文标签必然糊成一团。
 
+**答案的 Markdown 在前端手写渲染，不引库**
+模型会输出 `**粗体**`、有序/无序列表、嵌套子步骤、`>` 引用块。原先前端用 `textContent` 直接显示，这些标记原样露出、观感很差。
+
+没有引 marked.js 之类的库，而是写了个约 60 行的渲染器（`chat.html` 的 `renderMarkdown`），只覆盖模型实际会用的语法。关键点是**先把整段 HTML 转义再解析**——答案里夹着文档正文，不转义等于把切片内容当标签执行（已实测 `<img onerror>` 与 `<script>` 都被转义成文本、不触发）。
+
+流式过程中**每收到一块就整段重渲染**，而不是追加文本节点：Markdown 上下文相关，列表要凑齐才能成块，追加渲染会先冒出一堆裸标记。实测流式期间加粗就已生效，不会等 final 才「跳变」。
+
+**答案的配图单列，且只放行参考内容里真实出现过的链接**
+`prompts/answer_out.prompt` 要求模型在答案末尾追加一个【图片】区块。`node_answer_output` 把它拆出来单独作为 `image_urls` 返回、并从正文里去掉——用户不必看到一堆裸链接。
+
+**为什么要白名单过滤**：模型可能编造或改写链接，直接透传会让前端显示一排破图。节点先从参考切片里正则抓出所有 Markdown 图片链接作为白名单，答案里不在白名单内的会被丢弃并记 warning。
+
+流式模式下**图片区块不推给前端**：一旦读到 `【图片】` 标记就停止推送 delta（但仍继续累积原文，否则解析不出链接），所以打字机效果不会闪过一段裸 URL。
+
+**一片都没检索到时直接兜底，不调 LLM**
+`reranked_docs` 为空时返回固定的「没有找到相关内容」而不是让模型自由发挥——没有参考内容时它只会编。
+
 **图谱检索只回 chunk_id，正文回 Milvus 取**
 图谱的 `:Chunk` 节点只存 chunk_id 与标题、**不存正文**——正文留在 Milvus。这样图谱不必重复存一份文本，代价是查询时多一次 Milvus 批量取（用的正是 `fetch_chunks_by_chunk_ids`，它本来就是为「只有 chunk_id 没有文本」的场景准备的）。
 
@@ -362,8 +381,8 @@ Milvus 每次重新入库都会生成**全新的 chunk_id**，重复导入时旧
 | 项 | 说明 |
 |---|---|
 | 图谱侧排序只是近似 | `node_query_kg` 按「种子实体权重 2 / 一跳邻居 1，再除以 df」打分，但 **df 反映的是抽取覆盖度而非真实词频**（`HAK 180` 只被抽到 2 个切片里），所以排序不精确。好在 RRF 只看排名、精度由下游重排决定——图内实测正确的切片都进了候选集 |
+| 答案配图未做去重与尺寸处理 | 同一张图可能因多切片命中而重复出现在 `image_urls` 里；大图直接原样加载，未生成缩略图 |
 | 自带图测试场景1恒失败 | `main_graph.py` 的 `__main__` 拿「烫金膜盒怎么安装？」（不带型号）当查询，产品名确认必然判拒识，四路检索全被跳过。这是既有缺陷，与该测试想验证的图拓扑无关；换成完整产品名即可通过 |
-| 答案仍是占位文本 | `node_answer_output` 在 `state['answer']` 为空时输出固定的演示文本，未接 LLM 生成；`image_urls` 也还是硬编码的 `example.com` |
 | `get_recent_messages` 曾取错数据 | 原实现 `sort(ASCENDING).limit(N)` 取的是**最旧** N 条，已修为倒序取再反转为正序 |
 | 相似度阈值 | `kb_item_names` 的 0.85/0.6 阈值取自教程代码（教程正文写的是 0.95，两处不一致） |
 | 无引用的模块 | `format_utils.py`、`mongo_history_utils_new.py` 均无引用 |

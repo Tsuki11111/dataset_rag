@@ -91,6 +91,8 @@ def run_query_graph(session_id: str, user_query: str, is_stream: bool = True):
         # 把最终答案存入任务结果，供非流式模式取用
         answer = (final_state or {}).get("answer", "")
         set_task_result(session_id, "answer", answer)
+        # 配图同样要带出去，否则非流式模式拿不到
+        set_task_result(session_id, "images", (final_state or {}).get("images") or [])
         # push_queue=is_stream：只有流式模式才推送进度，避免无连接时产生告警噪音
         update_task_status(session_id, TASK_STATUS_COMPLETED, is_stream)
         logger.info(f"[{NODE_NAME}] [{function_name}] 检索图执行完成，session={session_id}")
@@ -142,12 +144,14 @@ async def query(background_tasks: BackgroundTasks, request: QueryRequest):
     update_task_status(session_id, TASK_STATUS_PROCESSING, is_stream)
     run_query_graph(session_id, user_query, is_stream)
     answer = get_task_result(session_id, "answer", "")
+    images = get_task_result(session_id, "images", [])
     done_list = get_done_task_list(session_id)
     clear_task(session_id)
     return {
         "message": "处理完成！",
         "session_id": session_id,
         "answer": answer,
+        "images": images,
         "done_list": done_list,
     }
 
