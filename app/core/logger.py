@@ -188,8 +188,12 @@ def enrich_record(record):
     """
     # --- 1. 调用位置 ---
     for frame in inspect.stack():
-        # 终极过滤：排除loguru内部 + 排除工具类logger.py自身，直接定位业务模块
-        if ("_logger.py" in frame.filename or frame.function == "_log") or "logger.py" in frame.filename:
+        # 过滤掉两类「代为记录」的帧，让位置落到真正的业务代码上：
+        # - loguru 内部与 logger.py 自身
+        # - error_policy.py：它的 degrade() 是替调用方记的日志，指到它没有意义
+        if (("_logger.py" in frame.filename or frame.function == "_log")
+                or "logger.py" in frame.filename
+                or "error_policy.py" in frame.filename):
             continue
         record.update(
             name=frame.filename.split("/")[-1].split("\\")[-1],

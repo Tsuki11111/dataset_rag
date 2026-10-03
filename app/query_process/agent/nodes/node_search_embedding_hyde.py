@@ -20,6 +20,7 @@ from langchain.messages import HumanMessage
 
 from app.clients.milvus_utils import dense_search, get_milvus_client
 from app.conf.milvus_config import milvus_config
+from app.core.error_policy import degrade, degrade_dependency
 from app.core.load_prompt import load_prompt
 from app.core.logger import logger
 from app.lm.embedding_utils import generate_embeddings
@@ -61,9 +62,8 @@ def step_1_create_hyde_doc(rewritten_query: str) -> str:
         logger.debug(f"[{NODE_NAME}] [{function_name}] 假设文档预览：{hyde_doc[:120]!r}")
         return hyde_doc
     except Exception as e:
-        # 生成失败不抛异常：HyDE 只是多路召回之一，缺了这一路不影响其他路
-        logger.error(f"[{NODE_NAME}] [{function_name}] 生成假设文档失败：{e}", exc_info=True)
-        return ""
+        # HyDE 只是四路召回之一，缺了这一路不影响其他路——但仍区分「外部故障」与「代码写错」
+        return degrade(NODE_NAME, "生成假设文档", "", e)
 
 
 def step_2_search_by_hyde(rewritten_query: str, hyde_doc: str, item_names) -> list:
@@ -95,7 +95,7 @@ def step_2_search_by_hyde(rewritten_query: str, hyde_doc: str, item_names) -> li
 
         client = get_milvus_client()
         if client is None:
-            logger.error(f"[{NODE_NAME}] [{function_name}] Milvus 客户端不可用，返回空结果")
+            return degrade_dependency(NODE_NAME, "假设文档检索", [], "Milvus 不可用")
             return []
 
         res = dense_search(
@@ -110,8 +110,7 @@ def step_2_search_by_hyde(rewritten_query: str, hyde_doc: str, item_names) -> li
         return res[0] if res else []
 
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 检索失败：{e}", exc_info=True)
-        return []
+        return degrade(NODE_NAME, "假设文档向量检索", [], e)
 
 
 def node_search_embedding_hyde(state: QueryGraphState) -> QueryGraphState:
@@ -161,8 +160,7 @@ def node_search_embedding_hyde(state: QueryGraphState) -> QueryGraphState:
         return {"hyde_embedding_chunks": chunks, "hyde_doc": hyde_doc}
 
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 执行失败：{e}", exc_info=True)
-        return {"hyde_embedding_chunks": [], "hyde_doc": ""}
+        return degrade(NODE_NAME, "HyDE 检索", {"hyde_embedding_chunks": [], "hyde_doc": ""}, e)
     finally:
         add_done_task(state["session_id"], function_name, state.get("is_stream"))
         logger.info(f"[{NODE_NAME}] [{function_name}] 处理结束")

@@ -12,6 +12,7 @@ RRF 核心公式：score += weight * 1 / (k + rank)
 import sys
 from typing import Any, Dict, List
 
+from app.core.error_policy import degrade
 from app.core.logger import logger
 from app.query_process.agent.state import QueryGraphState
 from app.utils.task_utils import add_running_task, add_done_task
@@ -150,8 +151,7 @@ def node_rrf(state: QueryGraphState) -> QueryGraphState:
 
     except Exception as e:
         # 融合失败不中断链路：返回空结果，下游会拿到空上下文
-        logger.error(f"[{NODE_NAME}] [{function_name}] 融合失败：{e}", exc_info=True)
-        return {"rrf_chunks": []}
+        return degrade(NODE_NAME, "RRF 融合", {"rrf_chunks": []}, e)
     finally:
         add_done_task(state["session_id"], function_name, state.get("is_stream"))
         logger.info(f"[{NODE_NAME}] [{function_name}] 处理结束")

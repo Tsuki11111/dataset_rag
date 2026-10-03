@@ -13,6 +13,7 @@
 import sys
 
 from app.clients.mcp_search_utils import McpSearchError, search_web
+from app.core.error_policy import degrade
 from app.core.logger import logger
 from app.query_process.agent.state import QueryGraphState
 from app.utils.task_utils import add_running_task, add_done_task
@@ -57,8 +58,7 @@ def node_web_search_mcp(state: QueryGraphState) -> QueryGraphState:
         logger.error(f"[{NODE_NAME}] [{function_name}] 联网搜索失败：{e}")
         return {"web_search_docs": []}
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 联网搜索异常：{e}", exc_info=True)
-        return {"web_search_docs": []}
+        return degrade(NODE_NAME, "联网搜索", {"web_search_docs": []}, e)
     finally:
         add_done_task(state["session_id"], function_name, state.get("is_stream"))
         logger.info(f"[{NODE_NAME}] [{function_name}] 处理结束")

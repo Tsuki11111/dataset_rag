@@ -11,6 +11,7 @@ import sys
 
 from app.clients.milvus_utils import dense_search, get_milvus_client
 from app.conf.milvus_config import milvus_config
+from app.core.error_policy import degrade, degrade_dependency
 from app.core.logger import logger
 from app.lm.embedding_utils import generate_embeddings
 from app.query_process.agent.state import QueryGraphState
@@ -79,7 +80,7 @@ def node_search_embedding(state: QueryGraphState) -> QueryGraphState:
         # 4. 稠密检索
         client = get_milvus_client()
         if client is None:
-            logger.error(f"[{NODE_NAME}] [{function_name}] Milvus 客户端不可用，返回空结果")
+            return degrade_dependency(NODE_NAME, "向量检索", {"embedding_chunks": []}, "Milvus 不可用")
             return {"embedding_chunks": []}
 
         res = dense_search(
@@ -106,9 +107,9 @@ def node_search_embedding(state: QueryGraphState) -> QueryGraphState:
         return {"embedding_chunks": chunks}
 
     except Exception as e:
-        # 检索失败不中断整条链路：返回空结果，让下游仍能继续（RRF 会忽略空路）
-        logger.error(f"[{NODE_NAME}] [{function_name}] 检索失败：{e}", exc_info=True)
-        return {"embedding_chunks": []}
+        # 向量检索是四路召回之一：失败就降级（RRF 会忽略空路），
+        # 但编程错误会被 degrade 上抛——正是这类错误此前被静默吞掉过
+        return degrade(NODE_NAME, "向量检索", {"embedding_chunks": []}, e)
     finally:
         add_done_task(state["session_id"], function_name, state.get("is_stream"))
         logger.info(f"[{NODE_NAME}] [{function_name}] 处理结束")

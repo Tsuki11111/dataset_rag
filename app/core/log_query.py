@@ -16,6 +16,9 @@
 # 按关键词搜（消息里包含就算命中）
 .venv/Scripts/python.exe -m app.core.log_query --grep 重排 --days 7 --limit 50
 
+# 只看降级事件：某一路召回/依赖失败后链路继续跑的那些（判断"哪个功能在悄悄失效"）
+.venv/Scripts/python.exe -m app.core.log_query --degraded --days 7
+
 # 保持原始 JSON（喂给别的工具）
 .venv/Scripts/python.exe -m app.core.log_query --trace 3dd63c53004e43c2 --json
 ```
@@ -60,6 +63,12 @@ def _match(item: Dict[str, Any], args) -> bool:
         return False
     if args.grep and args.grep not in (item.get("message") or ""):
         return False
+    if args.degraded:
+        # 降级事件由 error_policy.degrade 打上 degraded=true；
+        # 有了这个开关，"哪条召回路径在悄悄降级"才查得出来
+        extra = item.get("extra") or {}
+        if not extra.get("degraded"):
+            return False
     return True
 
 
@@ -83,6 +92,8 @@ def main(argv=None) -> int:
     parser.add_argument("--node", help="按图节点名精确查，如 node_rerank")
     parser.add_argument("--level", help="按级别查：INFO / WARNING / ERROR")
     parser.add_argument("--grep", help="消息包含该子串")
+    parser.add_argument("--degraded", action="store_true",
+                        help="只看降级事件（某一路召回/依赖失败后继续跑的记录）")
     parser.add_argument("--days", type=float, default=1.0, help="回看天数，默认 1（今天）")
     parser.add_argument("--limit", type=int, default=200, help="最多输出多少条，默认 200")
     parser.add_argument("--json", action="store_true", help="输出原始 JSON 行而不是人读格式")

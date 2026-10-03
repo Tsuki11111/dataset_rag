@@ -21,6 +21,7 @@ import sys
 from langchain.messages import HumanMessage, SystemMessage
 
 from app.clients.mongo_history_utils import get_recent_messages, save_chat_message
+from app.core.error_policy import degrade, is_fatal
 from app.core.load_prompt import load_prompt
 from app.core.logger import logger
 from app.core.usage_tracker import usage_context
@@ -233,16 +234,19 @@ def node_answer_output(state: QueryGraphState) -> QueryGraphState:
             save_chat_message(session_id, "assistant", final_text)
             logger.info(f"[{NODE_NAME}] [{function_name}] 助手消息已存档")
         except Exception as e:
-            # 存档失败不应影响答案返回
-            logger.error(f"[{NODE_NAME}] [{function_name}] 助手消息存档失败：{e}", exc_info=True)
+            # 存档失败不应影响答案返回，但编程错误要被上抛（存档写错也是 bug）
+            degrade(NODE_NAME, "助手消息存档", None, e)
 
         return {"answer": final_text, "images": images}
 
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 生成失败：{e}", exc_info=True)
+        # 最后一环，没有可降级的兜底内容：编程错误直接上抛，
+        # 其余的给用户一条明确的失败提示（流式下推 error 事件）
+        if is_fatal(e):
+            raise
         if is_stream:
             push_to_session(session_id, SSEEvent.ERROR, {"error": f"答案生成失败：{e}"})
-        return {"answer": ""}
+        return degrade(NODE_NAME, "答案生成", {"answer": ""}, e)
     finally:
         add_done_task(state["session_id"], function_name, state.get("is_stream"))
         logger.info(f"[{NODE_NAME}] [{function_name}] 节点处理结束")

@@ -44,7 +44,7 @@ app/
 │   └── neo4j_utils.py       # Neo4j 知识图谱读写、幂等清理、图谱统计
 ├── conf/                    # 各服务的配置类（读 .env），含 pricing_config.py（模型计价表）
 ├── core/                    # 日志（人读文本 + 机器读 JSONL + log_query 查询入口）、提示词加载、
-│                            #   request_context（请求归因）、usage_tracker（单次调用记账）
+│                            #   request_context（请求归因）、usage_tracker（记账）、error_policy（异常分级）
 ├── lm/                      # LLM 客户端、嵌入、重排
 ├── import_process/          # ── 导入链路 ──
 │   ├── agent/main_graph.py      # 导入图编排 + 端到端测试
@@ -135,7 +135,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 目前处在中间偏下。
 
 > **本节是路线的唯一权威**，HANDOFF 只留指针，避免两份文档各自演化。
-> 当前进度：**16 项完成 3 项**。
+> 当前进度：**16 项完成 4 项**（Phase 1 四项全部完成）。
 
 文中两个判断值得记住：
 「**Checkpoint + Durable Execution 是从 Demo 到生产最关键一步**」，
@@ -147,7 +147,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 
 | 问题 | 现状 |
 |---|---|
-| **异常被 `except` 吞掉** | 实现 `node_query_kg` 时一个 `NameError` 被「失败不中断链路」的兜底 `except` 降级成 warning，图谱那一路静默返回空、功能等于废了，只有测试断言才发现 |
+| ~~**异常被 `except` 吞掉**~~ | **✅ 已解决**，见[「异常分级处置」](#异常分级处置)：实现 `node_query_kg` 时一个 `NameError` 被「失败不中断链路」的兜底 `except` 降级成 warning，图谱那一路静默返回空、功能等于废了，只有测试断言才发现。现在编程错误会**上抛**，外部故障降级但带 `degraded` 标记、可用 `log_query --degraded` 查出来 |
 | **任务状态在内存里** | `task_utils` 用普通 dict 存运行/完成列表，**服务一重启，进行中的导入就凭空消失** |
 | ~~**成本完全不可见**~~ | **✅ 已解决**，见[「调用记账」](#调用记账)：一次问答要调 LLM + 四路召回 + 重排 + 图谱 + MCP，此前花了多少、谁花的账上一片空白；现在每次调用逐笔入账，可按类型 / 模型 / 租户 / 单次请求归集 |
 
@@ -163,14 +163,17 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 - [x] **结构化日志** —— ✅ 已完成，见[「结构化日志」](#结构化日志)一节：
       控制台保留人读格式并挂上 `[trace·node]` 标签，另存一份 JSONL 给机器查；
       归因字段复用记账那套 `request_context`，业务代码一行没改
-- [ ] **异常分级处置** —— 按 timeout / 429 / 5xx / refusal / invalid tool args 分别处理，
-      替掉现在一律 `except: return []` 的写法
+- [x] **异常分级处置** —— ✅ 已完成，见[「异常分级处置」](#异常分级处置)一节：
+      编程错误上抛、外部故障按可重试/需人工分类降级，所有降级带 `degraded` 标记可统计。
+      重试策略按路线留在 Phase 2
 
 ### Phase 2 · 可靠性
 
 - [ ] **LangGraph checkpointer**（`SqliteSaver` / `PostgresSaver`）
       —— 框架自带，接上即可从断点续跑；文中称这是「从 Demo 到生产最关键一步」
 - [ ] 故障分类重试：timeout 有限重试、429 退避、refusal 不盲重试、invalid tool args 绝不执行
+      —— 分类已就绪（见[「异常分级处置」](#异常分级处置)，`retryable` 已标好），只差重试策略。
+      **动手前先用 `log_query --degraded` 统计几天的错误分布**，别拍脑袋定次数与退避
 - [ ] 单节点超时 + 整个查询的 wall-clock / token 预算
 - [ ] `task_utils` 从内存搬到 Redis / Postgres
 
@@ -501,6 +504,59 @@ JSONL 那一份**不是**在 `format` 里拼出来的，而是在补丁里预渲
 另外两点：可调用 format **不会自动补换行**（字符串 format 会），换行要自己加；
 `serialize=True` 虽是 loguru 内置的结构化输出，但它**丢弃所有自定义 record 字段**
 （实测 `trace_id` 全变 `None`），所以用不了。
+
+---
+
+## 异常分级处置
+
+四路召回、图谱、联网、重排这些环节都是「失败就降级、链路继续」。此前它们一律写成
+`except Exception: 记日志 + 返回空`，**把编程错误和外部故障混为一谈**——
+项目历史上就因此把一个 `NameError` 吞成了 warning，图谱那一路静默失效、只有测试断言才发现。
+
+现在先分类、再按类处置（`app/core/error_policy.py`）：
+
+| 分类 | 什么情况 | 怎么处置 |
+|---|---|---|
+| `FATAL` | 代码自身不一致：`NameError` / `UnboundLocalError` / `ImportError` / `NotImplementedError` / `AssertionError` / `SyntaxError` / `IndentationError` / `RecursionError` | **上抛**，不降级掩盖 |
+| `RETRYABLE` | 暂时性外部故障：超时、连接失败、429、5xx、`ServerSelectionTimeoutError` | 降级 + warning（**Phase 2 的重试接在这里**） |
+| `BLOCKED` | 重试无用且要人处理：4xx（鉴权/参数）、配置缺失 | 降级 + error（带堆栈） |
+| `UNEXPECTED` | 兜底：外部依赖其它异常、数据结构不符预期 | 降级 + error（带堆栈） |
+
+```python
+except Exception as e:
+    return degrade(NODE_NAME, "图谱检索", {"kg_chunks": []}, e)   # 异常 → 分类处置
+
+if not is_neo4j_available():
+    return degrade_dependency(NODE_NAME, "图谱检索", {"kg_chunks": []}, "Neo4j 不可用")
+```
+
+### 三个关键取舍
+
+**为什么 `TypeError` / `KeyError` / `AttributeError` 不算 FATAL**
+它们既能由我们写错引起，也能由外部返回的数据变形引起（SDK 改结构、接口少字段），
+在降级点上分不清。所以归为 `UNEXPECTED`：**仍然降级**（保住"一路坏不影响整条链路"的设计），
+但记 error 级 + 完整堆栈。**"静默"才是当初真正的问题，降级本身不是**——
+`FATAL` 只留给解释器明确指向"我们代码内部矛盾"的那几类，它们与外部数据无关。
+
+**前置检查也要打降级标记**（`degrade_dependency`）
+Neo4j 没起、Milvus 连不上、集合名没配——这些是主动探测到的依赖缺失，没有异常对象可分类。
+但它们**同样是功能在静默失效**：图谱那一路整段没跑、产品名对齐整段没跑，
+用户只觉得"答得不好"。所以单独一个入口，照样打 `degraded` 标记。
+（这是实测发现的：Neo4j 停掉后跑一次问答，那条 warning 在 `--degraded` 里查不出来。）
+
+**这一步只分类、不做重试**
+README 的路线把「故障分类重试」放在 Phase 2，这里的职责是**把类型分清、处置分明**。
+重试要等有了稳定的错误分布数据再加——现在连"哪类错误出现过几次"都还统计不了，
+拍脑袋定重试次数只会白等。分类里已经标好 `retryable`，接重试时直接用。
+
+### 怎么知道哪个功能在悄悄失效
+
+```bash
+.venv/Scripts/python.exe -m app.core.log_query --degraded --days 7
+```
+
+所有降级（不论是异常触发还是前置检查）都带 `degraded=true` 与 `kind`，
+一条命令列出「哪些路在降级、降的哪一类」。
 
 ---
 

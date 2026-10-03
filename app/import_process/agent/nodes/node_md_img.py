@@ -24,6 +24,7 @@ from langchain_core.exceptions import LangChainException
 from app.conf.minio_config import minio_config
 from app.conf.lm_config import lm_config
 # 项目日志工具（统一使用）
+from app.core.error_policy import degrade
 from app.core.logger import logger
 # api访问限速工具
 from app.utils.rate_limit_utils import apply_api_rate_limit
@@ -230,7 +231,8 @@ def step4_upload_image_and_replace_md(summaries, md_content, targets, stem):
             image_url[image_file] = f"http://{minio_config.endpoint}/{minio_config.bucket_name}{minio_config.minio_img_dir}/{stem}/{image_file}"
             logger.info(f"[{NODE_NAME}] [{function_name}] 图片 [{image_file}] 已上传到 MinIO,访问地址为{image_url[image_file]}")
         except Exception as e:
-            logger.error(f"[{NODE_NAME}] [{function_name}] 图片 [{image_file}] 上传到 MinIO 失败，错误信息: {e}")
+            # 单张图失败只跳过这张，不影响整篇文档的其余图片
+            degrade(NODE_NAME, f"图片[{image_file}]上传 MinIO", None, e)
     image_infos = {}
     for image_file,summary in summaries.items():
         if url := image_url.get(image_file):

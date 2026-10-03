@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.clients.minio_utils import get_minio_client
+from app.core.error_policy import degrade
 from app.core.logger import logger
 from app.core.usage_tracker import usage_context
 from app.import_process.agent.main_graph import kb_import_app
@@ -51,6 +52,9 @@ from app.utils.task_utils import (
 ALLOWED_EXTENSIONS = {".pdf", ".md"}
 # 单文件大小上限（200MB），防止异常大文件
 MAX_FILE_SIZE = 200 * 1024 * 1024
+
+# 服务名，用于降级日志的标识（本模块不在图内，没有节点名可用）
+NODE_NAME = "file_import_service"
 
 app = FastAPI(
     title="File Import Service",
@@ -242,7 +246,8 @@ async def upload_files(
         try:
             _save_upload_file(file, local_file_abs_path)
         except Exception as e:
-            logger.error(f"[{function_name}] 文件保存失败：{original_name}，{e}", exc_info=True)
+            # 单个文件保存失败只记进失败列表，其余文件继续；编程错误由 degrade 上抛
+            degrade(NODE_NAME, f"保存上传文件[{original_name}]", None, e)
             failed_files.append({"filename": original_name, "reason": f"文件保存失败：{e}"})
             continue
 
@@ -294,7 +299,8 @@ async def upload_files(
             )
             logger.info(f"[{task_id}] 文件已上传MinIO：{minio_object_name}")
         except Exception as e:
-            logger.warning(f"[{task_id}] 文件上传MinIO失败，继续本地处理：{str(e)}")
+            # MinIO 是"顺手备份"，失败不影响本地处理
+            degrade(NODE_NAME, "上传原始文件到 MinIO", None, e)
 
         add_done_task(task_id, "upload_file")
 

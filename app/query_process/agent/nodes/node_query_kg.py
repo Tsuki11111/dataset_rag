@@ -16,6 +16,7 @@ import sys
 from app.clients.milvus_utils import fetch_chunks_by_chunk_ids, get_milvus_client
 from app.clients.neo4j_utils import is_neo4j_available, query_kg_chunks
 from app.conf.milvus_config import milvus_config
+from app.core.error_policy import degrade, degrade_dependency
 from app.core.logger import logger
 from app.query_process.agent.state import QueryGraphState
 from app.utils.task_utils import add_running_task, add_done_task
@@ -55,8 +56,7 @@ def step_3_fetch_content(hits: list) -> list:
     function_name = sys._getframe().f_code.co_name
     client = get_milvus_client()
     if client is None:
-        logger.error(f"[{NODE_NAME}] [{function_name}] Milvus 不可用，无法取切片正文")
-        return []
+        return degrade_dependency(NODE_NAME, "图谱切片正文取回", [], "Milvus 不可用")
 
     rows = fetch_chunks_by_chunk_ids(
         client,
@@ -108,8 +108,7 @@ def node_query_kg(state: QueryGraphState) -> QueryGraphState:
 
         # 前置检查：Neo4j 不可用就整段跳过。图谱是补充召回，不该拖垮整条链路
         if not is_neo4j_available():
-            logger.warning(f"[{NODE_NAME}] [{function_name}] Neo4j 不可用，跳过图谱检索")
-            return {"kg_chunks": []}
+            return degrade_dependency(NODE_NAME, "图谱检索", {"kg_chunks": []}, "Neo4j 不可用")
 
         hits = step_2_query_graph(item_names, query)
         if not hits:
@@ -128,8 +127,8 @@ def node_query_kg(state: QueryGraphState) -> QueryGraphState:
         return {"kg_chunks": docs}
 
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 图谱检索异常：{e}", exc_info=True)
-        return {"kg_chunks": []}
+        # 图谱是四路召回之一，失败降级；编程错误由 degrade 上抛
+        return degrade(NODE_NAME, "图谱检索", {"kg_chunks": []}, e)
     finally:
         add_done_task(state["session_id"], function_name, state.get("is_stream"))
         logger.info(f"[{NODE_NAME}] [{function_name}] 处理结束")

@@ -7,6 +7,7 @@ from pymilvus import MilvusClient
 from app.clients.milvus_utils import get_milvus_client, upsert_item_name
 from app.conf.milvus_config import milvus_config
 from app.core.load_prompt import load_prompt
+from app.core.error_policy import degrade
 from app.core.logger import logger
 from app.import_process.agent.state import ImportGraphState
 from app.lm.embedding_utils import generate_embeddings
@@ -163,8 +164,8 @@ def step_3_call_llm(file_title: str, context: str) -> str:
         return item_name
 
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 大模型调用失败，原因：{str(e)}", exc_info=True)
-        return file_title
+        # 识别不出产品名就退回用文件名当产品名，导入继续
+        return degrade(NODE_NAME, "识别产品名", file_title, e)
 
 
 def step_4_update_chunks(state: ImportGraphState, chunks: List[Dict], item_name: str) -> None:
@@ -215,8 +216,7 @@ def step_5_generate_vectors(item_name: str):
             logger.warning(f"[{NODE_NAME}] [{function_name}] 向量生成工具返回空结果，无法提取向量")
             dense_vector = None
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 向量生成失败，原因：{str(e)}", exc_info=True)
-        dense_vector = None
+        dense_vector = degrade(NODE_NAME, "产品名向量化", None, e)
 
     return dense_vector
 
@@ -310,8 +310,7 @@ def step_6_save_to_milvus(
         return False
 
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 数据存入Milvus失败，原因：{str(e)}", exc_info=True)
-        return False
+        return degrade(NODE_NAME, "产品名写入 Milvus", False, e)
 
 
 def node_item_name_recognition(state: ImportGraphState) -> ImportGraphState:

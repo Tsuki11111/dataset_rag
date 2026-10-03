@@ -32,6 +32,7 @@ from app.clients.mongo_history_utils import (
 )
 from app.conf.milvus_config import milvus_config
 from app.core.load_prompt import load_prompt
+from app.core.error_policy import ErrorKind, degrade, degrade_dependency
 from app.core.logger import logger
 from app.lm.embedding_utils import generate_embeddings
 from app.lm.lm_utils import get_llm_client
@@ -69,9 +70,8 @@ def step_1_get_history(session_id: str) -> List[Dict[str, Any]]:
     try:
         history = get_recent_messages(session_id, limit=HISTORY_LIMIT)
     except Exception as e:
-        # 历史读取失败不应中断流程，退化为无上下文
-        logger.error(f"[{NODE_NAME}] [{function_name}] 读取历史失败，将无上下文继续：{e}", exc_info=True)
-        history = []
+        # 历史读取失败退化为无上下文，不中断流程；编程错误由 degrade 上抛
+        history = degrade(NODE_NAME, "读取会话历史", [], e)
     logger.info(f"[{NODE_NAME}] [{function_name}] 取到{len(history)}条历史消息")
     return history
 
@@ -87,8 +87,7 @@ def step_2_save_user_message(session_id: str, original_query: str) -> str:
         logger.info(f"[{NODE_NAME}] [{function_name}] 用户消息已保存，ID={message_id}")
         return message_id
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 保存用户消息失败：{e}", exc_info=True)
-        return ""
+        return degrade(NODE_NAME, "保存用户消息", "", e)
 
 
 def step_3_extract_info(query: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -138,8 +137,7 @@ def step_3_extract_info(query: str, history: List[Dict[str, Any]]) -> Dict[str, 
 
     except Exception as e:
         # LLM 失败或 JSON 解析失败都退化为「无产品名 + 原问题」，保证流程不中断
-        logger.error(f"[{NODE_NAME}] [{function_name}] LLM提取失败，回退为原始问题：{e}", exc_info=True)
-        return fallback
+        return degrade(NODE_NAME, "LLM 提取产品名", fallback, e)
 
 
 def step_4_vectorize_and_query(item_names: List[str]) -> List[Dict[str, Any]]:
@@ -157,20 +155,19 @@ def step_4_vectorize_and_query(item_names: List[str]) -> List[Dict[str, Any]]:
 
     client = get_milvus_client()
     if client is None:
-        logger.error(f"[{NODE_NAME}] [{function_name}] Milvus不可用，跳过产品名对齐")
-        return results
+        # 这条尤其要紧：产品名对齐挂掉会让所有提问都落到"拒识"，用户只会觉得"什么都查不到"
+        return degrade_dependency(NODE_NAME, "产品名对齐", results, "Milvus 不可用")
 
     collection_name = milvus_config.item_name_collection
     if not collection_name:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 未配置ITEM_NAME_COLLECTION")
-        return results
+        return degrade_dependency(NODE_NAME, "产品名对齐", results,
+                                  "未配置 ITEM_NAME_COLLECTION", ErrorKind.BLOCKED)
 
     try:
         embeddings = generate_embeddings(item_names)
         dense_vectors = embeddings.get("dense") or []
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] [{function_name}] 产品名向量化失败：{e}", exc_info=True)
-        return results
+        return degrade(NODE_NAME, "产品名向量化", results, e)
 
     for idx, name in enumerate(item_names):
         try:
@@ -195,7 +192,7 @@ def step_4_vectorize_and_query(item_names: List[str]) -> List[Dict[str, Any]]:
 
         except Exception as e:
             # 单个产品名失败不影响其余产品名
-            logger.error(f"[{NODE_NAME}] [{function_name}] 检索产品名[{name}]失败：{e}", exc_info=True)
+            degrade(NODE_NAME, f"检索产品名[{name}]", None, e)
 
     return results
 
@@ -317,7 +314,7 @@ def step_6_check_confirmation(
                 logger.info(f"[{NODE_NAME}] [{function_name}] 已为{len(ids_to_update)}条历史消息补上产品名")
             except Exception as e:
                 # 历史回填失败不影响本次检索
-                logger.error(f"[{NODE_NAME}] [{function_name}] 回填历史产品名失败：{e}", exc_info=True)
+                degrade(NODE_NAME, "回填历史产品名", None, e)
 
         logger.info(f"[{NODE_NAME}] [{function_name}] 分支A：已确认产品 {confirmed}")
         return {
@@ -358,7 +355,7 @@ def step_7_write_history(
             save_chat_message(session_id, "assistant", answer)
             logger.info(f"[{NODE_NAME}] [{function_name}] 助手消息已存档")
         except Exception as e:
-            logger.error(f"[{NODE_NAME}] [{function_name}] 助手消息存档失败：{e}", exc_info=True)
+            degrade(NODE_NAME, "助手消息存档", None, e)
 
     if message_id:
         try:
@@ -368,7 +365,7 @@ def step_7_write_history(
             )
             logger.info(f"[{NODE_NAME}] [{function_name}] 用户消息已更新（改写结果+产品名）")
         except Exception as e:
-            logger.error(f"[{NODE_NAME}] [{function_name}] 用户消息更新失败：{e}", exc_info=True)
+            degrade(NODE_NAME, "用户消息更新", None, e)
 
 
 def node_item_name_confirm(state: QueryGraphState) -> QueryGraphState:

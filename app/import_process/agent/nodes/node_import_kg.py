@@ -22,6 +22,7 @@ from app.clients.neo4j_utils import (
     write_doc_graph,
 )
 from app.core.load_prompt import load_prompt
+from app.core.error_policy import degrade, degrade_dependency
 from app.core.logger import logger
 from app.import_process.agent.state import ImportGraphState
 from app.lm.lm_utils import get_llm_client
@@ -109,10 +110,8 @@ def step_4_extract_all(batches: list, item_name: str) -> list:
         try:
             per_chunk = step_3_extract_batch(batch, item_name)
         except Exception as e:
-            logger.error(
-                f"[{NODE_NAME}] [{function_name}] 第 {bi}/{len(batches)} 批抽取失败，"
-                f"该批 {len(batch)} 个切片跳过：{e}"
-            )
+            # 单批失败只跳过该批，其余批次继续；编程错误由 degrade 上抛
+            degrade(NODE_NAME, f"第 {bi}/{len(batches)} 批实体抽取", None, e)
             per_chunk = []
 
         aligned = [{} for _ in batch]
@@ -230,7 +229,7 @@ def node_import_kg(state: ImportGraphState) -> ImportGraphState:
     try:
         # 前置检查：Neo4j 不可用就整段跳过，不能拖垮文档导入
         if not is_neo4j_available():
-            logger.warning(f"[{NODE_NAME}] [{function_name}] Neo4j 不可用，跳过图谱构建")
+            return degrade_dependency(NODE_NAME, "图谱构建", {}, "Neo4j 不可用")
             return {}
         ensure_neo4j_schema()
 
@@ -255,9 +254,9 @@ def node_import_kg(state: ImportGraphState) -> ImportGraphState:
         return {}
 
     except Exception as e:
-        # 图谱失败不影响文档本身已入库的切片，所以不 raise
-        logger.error(f"[{NODE_NAME}] [{function_name}] 图谱构建异常：{e}", exc_info=True)
-        return {}
+        # 图谱失败不影响文档本身已入库的切片，所以降级而不是 raise——
+        # 但「编程错误」例外，那说明图谱这段代码本身有问题，必须暴露（degrade 会处理这个区分）
+        return degrade(NODE_NAME, "图谱构建", {}, e)
     finally:
         add_done_task(state.get("task_id", ""), function_name)
         logger.info(f"[{NODE_NAME}] [{function_name}] 处理结束")

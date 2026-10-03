@@ -13,6 +13,7 @@
 """
 import sys
 
+from app.core.error_policy import degrade
 from app.core.logger import logger
 from app.lm.reranker_utils import rerank
 from app.query_process.agent.state import QueryGraphState
@@ -107,8 +108,8 @@ def step_2_rerank_docs(state: QueryGraphState, doc_items: list) -> list:
     try:
         scored = rerank(question, texts)
     except Exception as e:
-        logger.error(f"[{NODE_NAME}] 重排失败，降级为原始顺序：{e}", exc_info=True)
-        return [{**d, "score": 0.0} for d in doc_items]
+        # 重排失败降级为原始顺序（分数记 0），保证链路不中断
+        return degrade(NODE_NAME, "重排打分", [{**d, "score": 0.0} for d in doc_items], e)
 
     # 接口按 index 指回入参下标，这里还原成完整文档
     out = [{**doc_items[s["index"]], "score": s["score"]} for s in scored]
@@ -175,8 +176,7 @@ def node_rerank(state: QueryGraphState) -> QueryGraphState:
 
     except Exception as e:
         # 重排失败不中断链路：返回空结果，答案生成会拿到空上下文
-        logger.error(f"[{NODE_NAME}] [{function_name}] 重排异常：{e}", exc_info=True)
-        return {"reranked_docs": []}
+        return degrade(NODE_NAME, "重排序", {"reranked_docs": []}, e)
     finally:
         add_done_task(state["session_id"], function_name, state.get("is_stream"))
         logger.info(f"[{NODE_NAME}] [{function_name}] 处理结束")
