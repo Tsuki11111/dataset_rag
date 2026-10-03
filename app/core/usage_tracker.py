@@ -7,10 +7,9 @@
 
 三块职责：
 
-1. **归因** —— ContextVar 里存「这次请求是谁发起的」。为什么不用参数传递：本项目的调用点
-   散在 16 个节点的 8 处，逐个传参既侵入又必漏（漏了还不报错，只是账本上少一笔）。
-   LangGraph 的并发执行器提交节点任务前会 `copy_context()`，所以入口处设一次，
-   四路并发检索（各自在不同线程）都能读到同一份归因。
+1. **归因** —— 上下文里存「这次请求是谁发起的」。上下文本身在
+   [request_context.py](request_context.py)：**日志也要读它**，而本模块依赖 logger，
+   放一起会成环，所以拆成叶子模块。
 2. **采集** —— LLM 走 LangChain callback（`TokenUsageCallback`，挂在 `get_llm_client`）；
    嵌入 / 重排 / 联网搜索不是 LangChain 调用，各自手工埋点。
 3. **落库** —— `record()` 统一写 MongoDB `llm_usage`（append-only）+ 打一行日志。
@@ -25,9 +24,7 @@ OpenAI 默认地址时才默认开启 `stream_usage`。本项目指向 DashScope
 import sys
 import threading
 import time
-import uuid
 from contextlib import contextmanager
-from contextvars import ContextVar
 from functools import wraps
 from typing import Any, Dict, Optional
 
@@ -35,18 +32,17 @@ from langchain_core.callbacks import BaseCallbackHandler
 
 from app.conf.pricing_config import estimate_cost
 from app.core.logger import logger
+# 归因上下文本身放在 request_context（叶子模块，日志也要读它，放这里会成环）
+from app.core.request_context import (
+    bind_context,
+    current_context,
+    new_trace_id,
+    raw_context,
+    reset_context,
+)
 
 # 节点名，与各节点里的 NODE_NAME 含义一致，仅用于日志前缀
 NODE_NAME = "usage_tracker"
-
-# 当前请求的归因上下文。默认 None 表示「不在任何请求里」（如命令行单跑某节点），
-# 此时照记不误，只是 tenant_id / node 等字段为空。
-_CTX: ContextVar[Optional[Dict[str, Any]]] = ContextVar("usage_context", default=None)
-
-
-def new_trace_id() -> str:
-    """生成一次请求的 trace_id（一次问答 = 一个 trace，会话里的多轮各自独立）"""
-    return uuid.uuid4().hex[:16]
 
 
 class UsageAccumulator:
@@ -127,31 +123,6 @@ class UsageAccumulator:
         )
 
 
-def bind_context(**kwargs) -> Any:
-    """
-    在当前上下文里设置归因字段，返回 token 供 `reset_context` 还原
-
-    合并语义：只覆盖传入的键，其余保留（如节点包装器只设 node，不动 trace/tenant）。
-    """
-    base = dict(_CTX.get() or {})
-    base.update(kwargs)
-    return _CTX.set(base)
-
-
-def reset_context(token: Any) -> None:
-    """还原到 `bind_context` 之前的上下文"""
-    try:
-        _CTX.reset(token)
-    except (ValueError, LookupError):
-        # token 与当前上下文不匹配（跨上下文 reset）时忽略：记账上下文宁可脏一点，也不要抛
-        pass
-
-
-def current_context() -> Dict[str, Any]:
-    """取当前归因上下文（去掉累计器与回调，避免调用方误改）"""
-    return {k: v for k, v in (_CTX.get() or {}).items() if k not in ("acc", "on_usage")}
-
-
 @contextmanager
 def usage_context(trace_id: str = None, tenant_id: str = None, session_id: str = None,
                   node: str = None, on_usage=None, **extra):
@@ -228,7 +199,7 @@ def record(
     :param ok: 调用是否成功；失败的调用同样入账，用于观察错误率
     :return: 落库的账目字典
     """
-    ctx = _CTX.get() or {}
+    ctx = raw_context()   # 这里要拿内部键 acc / on_usage，故不过滤
     cost = estimate_cost(model, prompt_tokens, completion_tokens) if ok else None
 
     item = {
@@ -261,12 +232,12 @@ def record(
             except Exception as e:
                 logger.warning(f"[{NODE_NAME}] 用量回调失败（不影响业务）：{e}")
 
+    # 节点名不再写进消息：它已经是日志的行首标签与结构化字段，写两遍纯属冗余
     logger.info(
         f"[记账] {kind:<10} model={model or '—':<18} "
         f"tokens={item['prompt_tokens']}+{item['completion_tokens']} "
         f"耗时={item['latency_ms']}ms "
         f"成本={'—' if cost is None else f'{cost:.6f}元'} "
-        f"node={item['node'] or '—'} "
         f"{'' if ok else '失败 ' + item['error']}"
     )
 

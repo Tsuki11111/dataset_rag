@@ -26,7 +26,8 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.clients.mongo_history_utils import clear_history, get_recent_messages
 from app.core.logger import logger
-from app.core.usage_tracker import current_context, usage_context
+from app.core.request_context import current_context
+from app.core.usage_tracker import usage_context
 from app.query_process.agent.main_graph import query_app
 from app.utils.auth_utils import clear_session_cookie, current_tenant, set_session_cookie
 from app.utils.sse_utils import SSEEvent, create_sse_queue, push_to_session, sse_generator

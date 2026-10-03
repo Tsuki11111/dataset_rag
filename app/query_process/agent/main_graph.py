@@ -2,7 +2,7 @@ from langgraph.constants import END
 from langgraph.graph import StateGraph
 
 from app.core.logger import logger
-from app.core.usage_tracker import add_tracked_node
+from app.core.usage_tracker import add_tracked_node, usage_context
 from app.query_process.agent.nodes.node_answer_output import node_answer_output
 from app.query_process.agent.nodes.node_item_name_confirm import node_item_name_confirm
 from app.query_process.agent.nodes.node_query_kg import node_query_kg
@@ -117,8 +117,13 @@ if __name__ == '__main__':
 
     logger.info(f"[检索图测试] 场景1：正常检索流程，session_id={session_id}")
     start = time.time()
-    final_state = query_app.invoke(init_state)
+    # 包一层记账/日志上下文：命令行跑图也给它一条 trace。
+    # 不包的话节点名有归因（add_tracked_node 在图上）、trace 与租户却空着，
+    # 日志串不成一条、账目也归不到「哪一次运行」——服务入口是包了的，这里要对齐。
+    with usage_context(session_id=session_id) as acc:
+        final_state = query_app.invoke(init_state)
     elapsed = time.time() - start
+    logger.info(f"[检索图测试] 本次问答记账：{acc.text()}")
 
     done = get_done_task_list(session_id)
     logger.info(f"[检索图测试] 执行完成，耗时 {elapsed:.1f} 秒")
@@ -164,8 +169,10 @@ if __name__ == '__main__':
         is_stream=False,
         answer="抱歉，未找到相关产品，请提供准确型号以便我为您查询。",
     )
-    branch_result = query_app.invoke(branch_state)
+    with usage_context(session_id=session_id2) as acc2:
+        query_app.invoke(branch_state)
     done2 = set(get_done_task_list(session_id2))
+    logger.info(f"[检索图测试] 场景2 记账：{acc2.text()}")
 
     logger.info(f"[检索图测试] 场景2 已完成节点：{done2}")
 

@@ -3,7 +3,7 @@ from langgraph.constants import END
 from langgraph.graph import StateGraph
 
 from app.core.logger import logger
-from app.core.usage_tracker import add_tracked_node
+from app.core.usage_tracker import add_tracked_node, usage_context
 from app.import_process.agent.nodes.node_item_name_recognition import node_item_name_recognition
 from app.import_process.agent.nodes.node_dashscope_embedding import node_dashscope_embedding
 from app.import_process.agent.nodes.node_document_split import node_document_split
@@ -130,11 +130,15 @@ if __name__ == '__main__':
     logger.info("[main_graph测试] 开始执行图...")
     start = time.time()
     try:
-        final_state = kb_import_app.invoke(init_state)
+        # 包一层记账/日志上下文：命令行跑图也要有一条 trace，
+        # 否则日志只有节点名没有 trace、账目也归不到「哪一次运行」（服务入口是包了的）
+        with usage_context(session_id=test_task_id) as acc:
+            final_state = kb_import_app.invoke(init_state)
     except Exception as e:
         logger.error(f"[main_graph测试] 图执行失败：{str(e)}", exc_info=True)
         raise
     elapsed = time.time() - start
+    logger.info(f"[main_graph测试] 本次导入记账：{acc.text()}")
 
     # --- 结果校验 ---
     logger.info("=" * 70)

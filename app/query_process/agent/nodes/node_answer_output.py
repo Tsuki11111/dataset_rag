@@ -23,6 +23,7 @@ from langchain.messages import HumanMessage, SystemMessage
 from app.clients.mongo_history_utils import get_recent_messages, save_chat_message
 from app.core.load_prompt import load_prompt
 from app.core.logger import logger
+from app.core.usage_tracker import usage_context
 from app.lm.lm_utils import get_llm_client
 from app.query_process.agent.state import QueryGraphState
 from app.utils.sse_utils import push_to_session, SSEEvent
@@ -340,7 +341,10 @@ if __name__ == '__main__':
             session_id=session_id, original_query=question, is_stream=False,
         )
         try:
-            result = query_app.invoke(st)
+            # 命令行跑图也包一层：日志能按 trace 串起来、账目能归到这一次运行
+            with usage_context(session_id=session_id) as acc:
+                result = query_app.invoke(st)
+            logger.info(f"[测试] 本次记账：{acc.text()}")
             answer = (result.get("answer") or "").strip()
             docs = result.get("reranked_docs") or []
             logger.info(f"[测试] 参考切片 {len(docs)} 条")

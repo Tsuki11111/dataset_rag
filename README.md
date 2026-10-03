@@ -43,7 +43,8 @@ app/
 │   ├── mcp_search_utils.py  # 百炼 MCP 联网搜索（Streamable HTTP）
 │   └── neo4j_utils.py       # Neo4j 知识图谱读写、幂等清理、图谱统计
 ├── conf/                    # 各服务的配置类（读 .env），含 pricing_config.py（模型计价表）
-├── core/                    # 日志、提示词加载、usage_tracker（单次调用记账）
+├── core/                    # 日志（人读文本 + 机器读 JSONL + log_query 查询入口）、提示词加载、
+│                            #   request_context（请求归因）、usage_tracker（单次调用记账）
 ├── lm/                      # LLM 客户端、嵌入、重排
 ├── import_process/          # ── 导入链路 ──
 │   ├── agent/main_graph.py      # 导入图编排 + 端到端测试
@@ -134,7 +135,7 @@ docker/milvus-compose.yml    # Milvus standalone 编排
 目前处在中间偏下。
 
 > **本节是路线的唯一权威**，HANDOFF 只留指针，避免两份文档各自演化。
-> 当前进度：**16 项完成 2 项**。
+> 当前进度：**16 项完成 3 项**。
 
 文中两个判断值得记住：
 「**Checkpoint + Durable Execution 是从 Demo 到生产最关键一步**」，
@@ -159,7 +160,9 @@ docker/milvus-compose.yml    # Milvus standalone 编排
       LangChain callback 采集 LLM 用量 + 三处手工埋点（嵌入 / 重排 / 联网搜索），
       逐笔写 MongoDB `llm_usage`，可按类型 / 模型 / 租户 / 单次请求出报表。
       `tenant_id` 已经进账本，为 Phase 3 的成本归因留好了接口
-- [ ] **结构化日志** —— 把纯文本日志换成带 `trace_id` / `tenant_id` / `node` 的结构化输出
+- [x] **结构化日志** —— ✅ 已完成，见[「结构化日志」](#结构化日志)一节：
+      控制台保留人读格式并挂上 `[trace·node]` 标签，另存一份 JSONL 给机器查；
+      归因字段复用记账那套 `request_context`，业务代码一行没改
 - [ ] **异常分级处置** —— 按 timeout / 429 / 5xx / refusal / invalid tool args 分别处理，
       替掉现在一律 `except: return []` 的写法
 
@@ -403,6 +406,101 @@ chunk 返回 usage。
 **记账绝不能反过来弄坏主流程**
 所有落库与用量解析都吞异常并降级为 warning：一次账单写不进去，不该让用户拿不到答案。
 回调里抛异常还会污染 LangChain 的调用链，`TokenUsageCallback` 的两个回调体都整体兜了。
+
+**数据库挂了也不能拖慢业务**：Mongo 连接超时收到 2 秒（pymongo 默认 30 秒），
+且失败后熔断 60 秒——否则每次模型调用都要重撞一遍连接超时。
+实测库不可用时首笔 2.8s、后续每笔 0.004s（改前每笔 30s）。
+熔断期结束会自动重试，不会永久放弃记账。
+
+---
+
+## 结构化日志
+
+**同一条日志记录，三种渲染，各给各的读者**——不会各记各的，因为没有第二份数据源：
+
+| 输出 | 格式 | 给谁 |
+|---|---|---|
+| 控制台 | 彩色人读，行首挂 `[9b2063cb·node_rerank]` 标签 | 开发时盯着看 |
+| `logs/app_年月日.log` | 同上但不带颜色 | `grep` / 翻历史 |
+| `logs/app_年月日.jsonl` | 每行一个 JSON 对象 | 程序、`jq`、将来接采集 |
+
+```bash
+# 看某一次请求的全部日志（一次问答 = 一个 trace，与账本里的 trace_id 相同）
+.venv/Scripts/python.exe -m app.core.log_query --trace 3dd63c53004e43c2
+
+# 只看图检索节点出的问题，回看最近 3 天
+.venv/Scripts/python.exe -m app.core.log_query --node node_query_kg --level ERROR --days 3
+
+# 按关键词搜消息
+.venv/Scripts/python.exe -m app.core.log_query --grep 触发断崖 --days 7 --limit 50
+
+# 原样输出 JSON，喂给别的工具
+.venv/Scripts/python.exe -m app.core.log_query --trace 3dd63c53004e43c2 --json
+```
+
+查询入口刻意做成了**命令行模块而不是只写 jq 用法**：本机没装 jq，只在文档里贴 jq 命令
+等于给了一个跑不通的示例。装过 jq 的话，等价的写法是
+`jq -c 'select(.trace_id=="...")' logs/*.jsonl`。
+
+**字段固定**：`ts` / `level` / `module` / `function` / `line` / `message`
+\+ 归因四件套 `trace_id` / `tenant_id` / `session_id` / `node`
+\+ 业务自己 bind 的 `extra` ＋（有异常时）`exception{type,message,traceback}`。
+归因字段**一定存在**，不在请求里时是空串而不是 `null`——这样 `select(.trace_id != "")` 这类查询不用额外判空。
+
+**消息开头重复的 `[节点名]` / `[函数名]` 会被自动去掉**
+节点代码沿用了 `logger.info(f"[{NODE_NAME}] [{function_name}] ...")` 的写法，而在**入口函数**里
+这两个名字恰好相同——消息自己就重复了一遍，再加上行首标签与 `module:function`，
+一整行里节点名能出现四次。实测**图内 41% 的日志如此**。现在补丁会剥掉开头连续的
+`[节点名]` / `[函数名]`：
+
+```
+改前：INFO | [59a0349a·node_item_name_confirm] node_item_name_confirm.py:node_item_name_confirm:382 - [node_item_name_confirm] [node_item_name_confirm] 开始处理
+改后：INFO | [59a0349a·node_item_name_confirm] node_item_name_confirm.py:node_item_name_confirm:382 - 开始处理
+```
+
+**为什么在补丁里收口、而不是去改 230 处 f-string**：一处生效、新节点自动受益，
+节点代码也不必为了日志好看而扭曲写法。只剥**开头连续**的、且内容确实等于当前节点名或
+函数名的方括号——正文中间的 `[重要]`、`[图片]` 一律不动。实测改前 41% → 改后 0%。
+
+**两种归因来自两个地方**，缺一个就只剩半个标签：`node` 由 `add_tracked_node` 在注册节点时包上，
+**只要走图就有**；`trace_id` / `tenant_id` / `session_id` 由 `usage_context` 在**入口**设置。
+所以五个入口（2 个服务 + 3 个命令行跑图的地方）都包了它——
+命令行入口漏包过一次，症状是日志里 `[node_rerank]` 有节点名却没 trace，账本里那几笔也归不到哪一次运行。
+**新增入口时照做。**
+
+### 三个设计取舍
+
+**归因字段复用记账那套 `request_context`，不另造 ID**
+`trace_id` 在[「调用记账」](#调用记账)里已经生成，日志直接读同一个 ContextVar。
+好处是**日志与账目天然对得上**：`jq` 出一个 trace 的日志、`summarize_trace()` 出同一条 trace 的账，
+两边拼起来就是「这次问答每一步说了什么、花了多少」。
+
+**注入靠补丁，不靠调用点自觉**
+`logger.py` 里一个 `enrich_record` 补丁统一附着字段，**16 个节点、几十处 `logger.info` 一行都没改**。
+让调用方自己带上下文是行不通的——漏了不报错，只是那几行日志悄悄少了两列。
+补丁顺带把「定位真实调用位置」的栈遍历合并进来，两个效果只走一次栈。
+
+**没有把文本日志换成 JSONL，而是并存**
+出问题时人肉读 JSON 很难受，机器读彩色文本同样难受。代价是多写一个文件——
+本项目日志量很小（一次问答百来行），这点 I/O 换两种读者都舒服，值得。
+`LOG_JSON_ENABLE=False` 可单独关掉。
+
+### 两个 loguru 的坑（改 `logger.py` 前必读）
+
+JSONL 那一份**不是**在 `format` 里拼出来的，而是在补丁里预渲染好、`format` 只写一个 `{jsonl}` 占位符。
+这不是绕远路，是因为 loguru 会把**可调用 format 的返回值再当模板解析一遍**，内容一旦进了模板就连踩两坑：
+
+1. JSON 的花括号被当字段名 → `KeyError: '"ts"'`
+2. 正文里的 `<frozen runpy>`、`<class 'ValueError'>` 被当**颜色标记** →
+   `ValueError: Tag "<module>" does not correspond to any known color directive`
+
+把内容留在**值**里就没这些问题：`format_map` 只把值当字符串替换，不再解析。
+模板恒定还让 loguru 的格式缓存（`lru_cache(maxsize=64)`）一直命中。
+`_json_format` 的注释里记了这两条的现场，别「优化」成直接返回 JSON 字符串。
+
+另外两点：可调用 format **不会自动补换行**（字符串 format 会），换行要自己加；
+`serialize=True` 虽是 loguru 内置的结构化输出，但它**丢弃所有自定义 record 字段**
+（实测 `trace_id` 全变 `None`），所以用不了。
 
 ---
 
