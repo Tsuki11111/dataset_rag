@@ -35,7 +35,21 @@ from app.core.logger import logger
 # 集合名
 COLLECTION_NAME = "llm_usage"
 
+# Mongo 选不到节点时的等待上限（毫秒）。
+# pymongo 默认 30 秒，而记账**在业务的关键路径上**——库挂了的话，每记一笔都要卡 30 秒，
+# 一次问答十来笔就是好几分钟。这里调到 2 秒，失败快一点，只丢账目不卡业务。
+SERVER_SELECTION_TIMEOUT_MS = 2000
+
+# 连接失败后的熔断时长（秒）：这段时间内不再尝试连接
+CONNECT_FAILURE_COOLDOWN_SEC = 60.0
+
 _usage_tool = None
+# 熔断截止时间戳（单调递增的 time.time()）。0 表示没在熔断
+_unavailable_until = 0.0
+
+
+class UsageStoreUnavailable(Exception):
+    """账本暂不可用（连接失败后的熔断期内），调用方直接跳过落库即可"""
 
 
 class UsageTool:
@@ -46,7 +60,11 @@ class UsageTool:
             self.mongo_url = os.getenv("MONGO_URL")
             self.db_name = os.getenv("MONGO_DB_NAME")
 
-            self.client = MongoClient(self.mongo_url)
+            # 显式给一个短超时，别用 pymongo 默认的 30 秒——原因见文件顶部的说明
+            self.client = MongoClient(
+                self.mongo_url,
+                serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
+            )
             self.db = self.client[self.db_name]
             self.collection = self.db[COLLECTION_NAME]
 
@@ -62,10 +80,24 @@ class UsageTool:
 
 
 def get_usage_tool() -> UsageTool:
-    """获取账本工具单例（懒加载）"""
-    global _usage_tool
+    """
+    获取账本工具单例（懒加载）
+
+    **失败后会熔断一段时间**：`UsageTool()` 初始化里有建索引，会真的连库；
+    连不上时异常会让单例保持为 None，于是**下一笔又要重新等一遍连接超时**——
+    库挂掉时每次模型调用都卡一轮。所以在失败后 60 秒内直接抛
+    `UsageStoreUnavailable`，让记账迅速跳过，而不是反复撞墙。
+    """
+    global _usage_tool, _unavailable_until
+    if time.time() < _unavailable_until:
+        raise UsageStoreUnavailable("账本连接失败后的冷却期内，跳过落库")
+
     if _usage_tool is None:
-        _usage_tool = UsageTool()
+        try:
+            _usage_tool = UsageTool()
+        except Exception:
+            _unavailable_until = time.time() + CONNECT_FAILURE_COOLDOWN_SEC
+            raise
     return _usage_tool
 
 
@@ -272,5 +304,13 @@ def _print_report(days: float) -> None:
 
 
 if __name__ == '__main__':
+    from pymongo.errors import PyMongoError
+
     days_arg = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
-    _print_report(days_arg)
+    try:
+        _print_report(days_arg)
+    except (UsageStoreUnavailable, PyMongoError) as e:
+        # 连不上时给人话，别把 pymongo 的拓扑描述甩给用户（首次尝试超时也是这一类）
+        print(f"\n账本连不上：{type(e).__name__}。确认 MongoDB 已启动：docker start mongo\n")
+    except Exception as e:
+        print(f"\n读取账本失败：{e}\n")
